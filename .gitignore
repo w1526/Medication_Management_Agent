@@ -11,3 +11,4 @@ data/*
 .env
 .dsh-home/
 .harness-workspace/
+*.md
