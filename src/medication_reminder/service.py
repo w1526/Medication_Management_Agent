@@ -1484,11 +1484,15 @@ class MedicationService:
                      AND sc.status IN ('PASS', 'WARN')
                      AND sc.check_failed=0
                      AND sc.ruleset_version=?
+                     AND sc.ruleset_fingerprint=?
                      AND o.confirmation_deadline_at > ?
                      AND o.next_reminder_at <= ?
                      AND o.reminder_claimed_at IS NULL
                    ORDER BY o.next_reminder_at, o.occurrence_id""",
-                (self.safety_ruleset_version, iso(clock), iso(clock)),
+                (
+                    self.safety_ruleset_version, self.safety_ruleset_fingerprint,
+                    iso(clock), iso(clock),
+                ),
             ).fetchall()
             for row in rows:
                 interaction_id = new_id("interaction")
@@ -2033,6 +2037,7 @@ class MedicationService:
             occurrence = connection.execute(
                 """SELECT o.*, p.status AS plan_status, p.version AS current_plan_version,
                           sc.status AS safety_status, sc.ruleset_version AS safety_ruleset_version,
+                          sc.ruleset_fingerprint AS safety_ruleset_fingerprint,
                           sc.check_failed AS safety_check_failed, sc.check_id AS safety_check_id
                    FROM medication_occurrence o JOIN medication_plan p
                    ON p.plan_id=o.plan_id AND p.version=o.plan_version
@@ -2053,10 +2058,12 @@ class MedicationService:
             )
             safety_invalid = bool(
                 occurrence is not None
+                and occurrence["intake_status"] == UNCONFIRMED
                 and (
                     occurrence["safety_status"] not in (STATUS_PASS, STATUS_WARN)
                     or int(occurrence["safety_check_failed"] or 0) != 0
                     or occurrence["safety_ruleset_version"] != self.safety_ruleset_version
+                    or occurrence["safety_ruleset_fingerprint"] != self.safety_ruleset_fingerprint
                 )
             )
             if ordinary_invalid or safety_invalid:
@@ -2076,7 +2083,9 @@ class MedicationService:
                             "check_id": occurrence["safety_check_id"],
                             "plan_version": occurrence["plan_version"],
                             "ruleset_version": self.safety_ruleset_version,
+                            "ruleset_fingerprint": self.safety_ruleset_fingerprint,
                             "stored_ruleset_version": occurrence["safety_ruleset_version"],
+                            "stored_ruleset_fingerprint": occurrence["safety_ruleset_fingerprint"],
                             "source_event_id": event["event_id"],
                         },
                     )

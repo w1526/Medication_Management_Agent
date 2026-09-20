@@ -98,9 +98,12 @@ class Application:
                         "plan_version": plan["version"],
                         "status": "NOT_CHECKED",
                         "ruleset_version": self.service.safety_ruleset_version,
+                        "ruleset_fingerprint": self.service.safety_ruleset_fingerprint,
                         "checked_at": None,
                         "findings": [],
                         "coverage": {},
+                        "coverage_complete": False,
+                        "coverage_status": "partial",
                         "trace_id": None,
                     }
                 return 200, safety
