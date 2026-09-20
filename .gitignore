@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+data/*
+!data/safety_rules.example.json
+*.db
+*.db-shm
+*.db-wal
+
+.env
+.dsh-home/
+.harness-workspace/

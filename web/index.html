@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f6f8fc" />
+    <title>用药守护台</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/core@1.5.1/dist/css/tabler.min.css" />
+    <link rel="stylesheet" href="/assets/app.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="app-navbar">
+        <div class="container-xl app-navbar-inner">
+          <a class="brand-link" href="/" aria-label="返回用药守护台首页">
+            <span class="brand-mark">✦</span>
+            <span class="brand-copy">
+              <span class="brand-title">用药守护台</span>
+              <span class="brand-subtitle">CONNECTED CARE · 2026</span>
+            </span>
+          </a>
+
+          <nav class="role-nav" id="role-nav" aria-label="角色工作台">
+            <a class="role-nav-link" data-role-link="elder" href="/elder">
+              <span class="role-nav-icon">♧</span><span>老人端</span>
+            </a>
+            <a class="role-nav-link" data-role-link="family" href="/family">
+              <span class="role-nav-icon">⌂</span><span>家属端</span>
+            </a>
+            <a class="role-nav-link" data-role-link="doctor" href="/doctor">
+              <span class="role-nav-icon">✚</span><span>医生端</span>
+            </a>
+          </nav>
+
+          <div class="navbar-actions">
+            <div class="connection-state" title="前端与用药服务的连接状态">
+              <span class="status-dot" id="connection-dot"></span>
+              <span id="connection-label">检查服务中</span>
+            </div>
+            <button class="icon-button" data-action="refresh" title="刷新共享数据" aria-label="刷新共享数据">↻</button>
+          </div>
+        </div>
+      </header>
+
+      <main class="page-wrapper">
+        <div class="container-xl page-container">
+          <section class="workspace-heading">
+            <div class="workspace-copy">
+              <div class="eyebrow" id="role-overline">CONNECTED CARE</div>
+              <h1 class="page-title" id="role-title">家属陪护工作台</h1>
+              <p class="page-lead" id="role-lead">建立计划、跟进提醒，把每一次服药确认同步给医生和老人。</p>
+            </div>
+            <div class="elder-context">
+              <div class="context-label-row">
+                <label for="elder-id">当前照护对象</label>
+                <span class="context-sync-dot"></span><span>三方实时共享</span>
+              </div>
+              <div class="input-group context-input">
+                <span class="input-group-text">ID</span>
+                <input id="elder-id" class="form-control" value="E001" autocomplete="off" aria-label="当前老人 ID" />
+                <button class="btn btn-primary" data-action="refresh">查看</button>
+              </div>
+              <div class="context-hint" id="sync-summary">正在读取共享状态…</div>
+            </div>
+          </section>
+
+          <section class="shared-status" id="shared-status" aria-live="polite">
+            <div class="shared-status-icon">↔</div>
+            <div class="shared-status-copy">
+              <strong id="shared-status-title">三方协同已连接</strong>
+              <span id="shared-status-detail">家属、医生和老人看到的是同一份计划、提醒与审计记录。</span>
+            </div>
+            <span class="shared-status-badge" id="shared-status-badge">同步中</span>
+          </section>
+
+          <div id="role-content"></div>
+
+          <footer class="app-footer">
+            <span>用药守护台 · Connected Care</span>
+            <span>同一老人 · 同一计划 · 同一条可审计的服药记录</span>
+          </footer>
+        </div>
+      </main>
+    </div>
+
+    <div class="toast-container position-fixed bottom-0 end-0 p-3" id="toast-container"></div>
+    <script src="https://cdn.jsdelivr.net/npm/@tabler/core@1.5.1/dist/js/tabler.min.js"></script>
+    <script src="/assets/app.js"></script>
+  </body>
+</html>

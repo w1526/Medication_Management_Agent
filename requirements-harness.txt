@@ -1,0 +1,4 @@
+# DeepSeek official Harness Python SDK.
+# The SDK requires Python 3.10+; install it inside the project .venv.
+deepseek-harness-sdk==0.1.5rc1
+

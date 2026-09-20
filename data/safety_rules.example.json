@@ -1,0 +1,27 @@
+{
+  "ruleset_version": "test-rules-v1",
+  "dose_rules": {
+    "TEST_DRUG_A": {
+      "rule_id": "fixture-dose-test-drug-a",
+      "unit": "mg",
+      "max_single_dose": 100,
+      "max_daily_dose": 200
+    }
+  },
+  "ddi_rules": [
+    {
+      "drugs": ["TEST_DRUG_A", "TEST_DRUG_B"],
+      "severity": "BLOCK",
+      "code": "FIXTURE_DDI_BLOCK",
+      "message": "fictional fixture interaction rule matched",
+      "rule_id": "fixture-ddi-a-b"
+    },
+    {
+      "drugs": ["TEST_DRUG_A", "TEST_DRUG_C"],
+      "severity": "WARN",
+      "code": "FIXTURE_DDI_WARN",
+      "message": "fictional fixture interaction warning matched",
+      "rule_id": "fixture-ddi-a-c"
+    }
+  ]
+}
