@@ -193,6 +193,18 @@
     return '<span class="soft-badge ' + info[1] + '">' + escapeHtml(info[0]) + "</span>";
   }
 
+  function safetyBadge(status, safety) {
+    var info = statusInfo(status);
+    if (status === "PASS") {
+      if (safety && safety.coverage_complete === true) {
+        info = ["基础安全检查通过 · 覆盖完整", "soft-green"];
+      } else {
+        info = ["基础安全检查通过 · 临床覆盖不完整", "soft-blue"];
+      }
+    }
+    return '<span class="soft-badge ' + info[1] + '">' + escapeHtml(info[0]) + "</span>";
+  }
+
   function toast(message, kind) {
     var container = byId("toast-container");
     if (!container) return;
@@ -483,14 +495,18 @@
       var coverageText = Object.keys(coverage).map(function (key) {
         return key + ": " + coverage[key];
       }).join(" · ");
+      var coverageSummary = safety.coverage_complete === true ?
+        "临床规则覆盖：完整" : "临床规则覆盖：不完整（未配置/无上下文项不会显示为临床安全确认）";
       var safetyDetails = '<div class="plan-safety-details">' +
         '<div>检查时间：' + escapeHtml(clock(safety.checked_at)) + ' · ruleset：' + escapeHtml(safety.ruleset_version || "—") + '</div>' +
+        '<div>规则指纹：' + escapeHtml((safety.ruleset_fingerprint || "—").slice(0, 16)) + ' · ' + escapeHtml(coverageSummary) + '</div>' +
         '<div>coverage：' + escapeHtml(coverageText || "—") + '</div>' +
         (findings.length ? '<details><summary>' + escapeHtml(findings.length + " 条 finding") + '</summary>' + findings.map(function (finding) {
           return '<div class="safety-finding"><span>' + escapeHtml(finding.severity || "") + '</span> ' + escapeHtml(finding.code || "") + ' · ' + escapeHtml(finding.message || "") + '</div>';
         }).join("") + '</details>' : '<div>findings：0</div>') +
+        (safetyStatus === "PASS" && safety.coverage_complete !== true ? '<div class="safety-coverage-note">基础安全检查通过不等于临床安全已确认。</div>' : '') +
         '</div>';
-      var safetyMarkup = '<div class="plan-safety">' + badge(safetyStatus) + safetyDetails + '</div>';
+      var safetyMarkup = '<div class="plan-safety">' + safetyBadge(safetyStatus, safety) + safetyDetails + '</div>';
       return '<tr><td><div class="plan-drug">' + escapeHtml(plan.drug_name) + '</div><div class="plan-dose">' + escapeHtml(plan.dosage_text) + ' · ' + escapeHtml(plan.elder_id) + '</div>' + safetyMarkup + '</td>' +
         '<td>' + escapeHtml(formatScheduleTime(plan.schedule_time)) + '</td><td>v' + escapeHtml(plan.version) + '</td><td>' + badge(plan.status) + '</td><td>' + action + '</td></tr>';
     }).join("");

@@ -288,3 +288,4 @@ button { transition: .18s ease; }
 .plan-safety-details details { margin-top: .15rem; }
 .safety-finding { border-left: 2px solid #d63939; margin-top: .2rem; padding-left: .35rem; }
 .safety-finding span { font-weight: 700; }
+.safety-coverage-note { margin-top: .25rem; color: #2463eb; font-weight: 700; }

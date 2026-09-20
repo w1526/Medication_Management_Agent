@@ -353,6 +353,10 @@ class SafetyRuleProvider:
             "ruleset_version": str(getattr(self, "ruleset_version", "unknown")),
         }
 
+    @property
+    def ruleset_fingerprint(self):
+        return _sha256_json(self.fingerprint_material())
+
     def check(self, plan):
         return None
 
