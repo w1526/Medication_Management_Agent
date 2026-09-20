@@ -12,3 +12,4 @@ data/*
 .dsh-home/
 .harness-workspace/
 *.md
+!/README.md
