@@ -12,4 +12,9 @@ data/*
 .dsh-home/
 .harness-workspace/
 *.md
+!docs/phase5_multi_evidence_confirmation.md
+!docs/phase5_multi_evidence_confirmation_implementation_report.md
 !/README.md
+!docs/phase4_advanced_scheduling.md
+!docs/phase4_advanced_scheduling_implementation_report.md
+!docs/phase4_1_patch_report.md

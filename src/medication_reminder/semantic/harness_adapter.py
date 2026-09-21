@@ -89,17 +89,28 @@ The JSON schema is:
   "elder_id": "string",
   "drug_name": "string or null",
   "dosage_text": "string or null",
-  "schedule_time": "HH:MM or null",
+  "schedule_type": "FIXED_TIME | MEAL_RELATION | INTERVAL | WEEKLY | CYCLE | PRN | null",
+  "schedule_config": "object or null",
+  "schedule_time": "HH:MM or null (legacy FIXED_TIME compatibility)",
   "relation_to_meal": "餐前 | 餐后 | null",
   "route": "oral or another explicit route or null",
   "start_date": "YYYY-MM-DD or null",
   "timezone": "Asia/Shanghai",
-  "missing_fields": ["drug_name", "dosage_text", "schedule_time"],
+  "missing_fields": ["drug_name", "dosage_text", "schedule_config"],
   "confidence": 0.0
 }
 Rules: use the supplied elder_id; default timezone is Asia/Shanghai; today is %s;
-never invent a drug, dose, or time; convert Chinese day-part expressions to a
-24-hour time (for example, 晚上10点 must be 22:00); if start_date is omitted,
+never invent a drug, dose, meal anchor, interval anchor, weekday, cycle date,
+or time; all schedule_type and schedule_config values must be copied from the
+user's explicit words.  Use MEAL_RELATION such as
+{"meal":"BREAKFAST","relation":"AFTER","offset_minutes":30} for
+"早餐后半小时".  Use INTERVAL only when both interval_hours and anchor_at
+are explicit.  Use WEEKLY only with explicit ISO weekdays (1=Monday, 7=Sunday).
+Use CYCLE only with explicit cycle_start_date, days_on, days_off and times.
+Use PRN with condition_text only and never turn it into a daily reminder.
+"一天两次" or "饭后吃" without concrete parameters is incomplete: leave
+schedule_config null and include schedule_config in missing_fields.  Never
+default to 08:00/20:00 or infer breakfast/bedtime.  If start_date is omitted,
 return null and include it in missing_fields (the deterministic caller will
 default it to today). Other missing required values go in missing_fields.
 

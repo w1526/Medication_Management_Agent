@@ -127,10 +127,12 @@ def _coverage_summary(coverage):
     coverage = dict(coverage or {})
     domains = ("structural", "dose_rules", "ddi", "allergy", "contraindication")
     values = [str(coverage.get(domain) or "unknown") for domain in domains]
-    if all(value == COVERAGE_CHECKED for value in values):
-        status = "complete"
-    elif COVERAGE_FAILED in values:
+    if COVERAGE_FAILED in values or any(
+        str(value) == COVERAGE_FAILED for value in coverage.values()
+    ):
         status = "failed"
+    elif all(value == COVERAGE_CHECKED for value in values):
+        status = "complete"
     else:
         status = "partial"
     return {
@@ -289,8 +291,8 @@ class SafetyCheckResult:
     plan_version: int
     status: str
     ruleset_version: str
-    ruleset_fingerprint: str
     checked_at: str
+    ruleset_fingerprint: str = None
     findings: list = field(default_factory=list)
     coverage: dict = field(default_factory=dict)
     trace_id: str = None
@@ -903,8 +905,18 @@ class SafetyEngine:
                 ))
             seen.add(canonical)
 
+        schedule_type = str(plan.get("schedule_type") or "").upper()
+        # Phase 4 validates advanced schedule structure before M2.  The old
+        # schedule_time field remains the compatibility check for fixed-time
+        # plans, but a meal/interval/PRN plan must not be blocked merely
+        # because it has no single legacy clock value.
+        requires_legacy_time = schedule_type in (
+            "", "DAILY", "FIXED_TIME", "WEEKLY", "CYCLE"
+        )
         schedule_time = plan.get("schedule_time")
-        if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", str(schedule_time or "")):
+        if requires_legacy_time and not re.fullmatch(
+            r"(?:[01]\d|2[0-3]):[0-5]\d", str(schedule_time or "")
+        ):
             findings.append(SafetyFinding(
                 category="structural",
                 severity=SEVERITY_BLOCK,
@@ -947,6 +959,8 @@ class SafetyFreezeService:
         "dose_value", "dose_unit", "frequency", "frequency_per_day",
         "times_per_day", "schedule_type", "schedule_time", "timezone",
         "route", "relation_to_meal", "instruction", "start_date", "end_date",
+        "schedule_config", "schedule_config_json",
+        "device_sn", "confirmation_window_minutes", "max_snooze_count",
     })
 
     def assert_safety_enabled(self, enabled):

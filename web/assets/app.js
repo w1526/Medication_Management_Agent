@@ -33,6 +33,9 @@
     events: [],
     notifications: [],
     escalations: [],
+    evidence: [],
+    confirmation: null,
+    evidenceOccurrenceId: null,
     seenNotifications: {},
     lastAgentResult: null,
     refreshGeneration: 0,
@@ -155,6 +158,43 @@
     var match = String(value).trim().match(/^(\d{1,2})(?::(\d{1,2}))?$/);
     if (!match) return String(value);
     return String(Number(match[1])).padStart(2, "0") + ":" + String(Number(match[2] || 0)).padStart(2, "0");
+  }
+
+  function scheduleSummary(plan) {
+    var type = plan.schedule_type || "FIXED_TIME";
+    var config = plan.schedule_config || {};
+    if (type === "FIXED_TIME") {
+      return "固定 " + (config.times || [plan.schedule_time]).map(formatScheduleTime).join("、");
+    }
+    if (type === "MEAL_RELATION") {
+      return config.meal + " " + config.relation + " " + config.offset_minutes + " 分钟";
+    }
+    if (type === "ROUTINE_RELATION") {
+      return config.anchor + " " + config.relation + " " + config.offset_minutes + " 分钟";
+    }
+    if (type === "INTERVAL") {
+      return "每 " + config.interval_hours + " 小时（anchor " + (config.anchor_at || "—") + "）";
+    }
+    if (type === "WEEKLY") {
+      return "每周 " + (config.weekdays || []).join("、") + " · " + (config.times || []).map(formatScheduleTime).join("、");
+    }
+    if (type === "CYCLE") {
+      return "服 " + config.days_on + " 天 / 停 " + config.days_off + " 天 · " + (config.times || []).map(formatScheduleTime).join("、");
+    }
+    if (type === "PRN") return "按需：" + (config.condition_text || "需人工触发");
+    return type;
+  }
+
+  function updateScheduleFields() {
+    var type = readValue("schedule-type", "FIXED_TIME");
+    ["FIXED_TIME", "MEAL_RELATION", "INTERVAL", "WEEKLY", "CYCLE", "PRN"].forEach(function (name) {
+      var node = byId("schedule-fields-" + name);
+      if (node) node.classList.toggle("d-none", type !== name);
+    });
+    var timeField = byId("schedule-time-field");
+    if (timeField) timeField.classList.toggle("d-none", ["FIXED_TIME", "WEEKLY", "CYCLE"].indexOf(type) < 0);
+    var mealField = byId("schedule-meal-field");
+    if (mealField) mealField.classList.toggle("d-none", type !== "MEAL_RELATION");
   }
 
   function formatDateLabel(value) {
@@ -507,8 +547,15 @@
         (safetyStatus === "PASS" && safety.coverage_complete !== true ? '<div class="safety-coverage-note">基础安全检查通过不等于临床安全已确认。</div>' : '') +
         '</div>';
       var safetyMarkup = '<div class="plan-safety">' + safetyBadge(safetyStatus, safety) + safetyDetails + '</div>';
+      var next = state.tasks.filter(function (task) {
+        return task.plan_id === plan.plan_id && Number(task.plan_version) === Number(plan.version) &&
+          task.intake_status === "unconfirmed";
+      }).sort(function (left, right) {
+        return String(left.scheduled_at).localeCompare(String(right.scheduled_at));
+      })[0];
+      var nextText = next ? " · 下一次 " + shortTime(next.scheduled_at) : "";
       return '<tr><td><div class="plan-drug">' + escapeHtml(plan.drug_name) + '</div><div class="plan-dose">' + escapeHtml(plan.dosage_text) + ' · ' + escapeHtml(plan.elder_id) + '</div>' + safetyMarkup + '</td>' +
-        '<td>' + escapeHtml(formatScheduleTime(plan.schedule_time)) + '</td><td>v' + escapeHtml(plan.version) + '</td><td>' + badge(plan.status) + '</td><td>' + action + '</td></tr>';
+        '<td><div>' + escapeHtml(scheduleSummary(plan)) + '</div><div class="table-note">' + escapeHtml("类型：" + (plan.schedule_type || "FIXED_TIME") + nextText) + '</div></td><td>v' + escapeHtml(plan.version) + '</td><td>' + badge(plan.status) + '</td><td>' + action + '</td></tr>';
     }).join("");
   }
 
@@ -522,6 +569,11 @@
       "device.interaction.request": "提醒已发给老人",
       "medication.user_response": "收到老人回复",
       "medication.intake.updated": "服药状态已更新",
+      "medication.evidence.recorded": "服药证据已记录",
+      "medication.confirmation.assessed": "多证据 Assessment 已完成",
+      "medication.confirmation.confirmed": "多证据确认已通过",
+      "medication.confirmation.conflict_detected": "证据冲突已发现",
+      "medication.confirmation.review_required": "证据进入人工复核",
       "medication.reminder.delayed": "提醒已延后",
       "medication.intake.unconfirmed": "任务关闭为未确认",
       "medication.escalation.opened": "异常升级已创建",
@@ -585,6 +637,136 @@
       return '<div class="event-item"><span class="event-dot"></span><div><div class="event-type">' + escapeHtml(eventLabel(event.event_type)) + '</div>' +
         '<div class="event-meta"><span>' + escapeHtml(event.source || "系统") + '</span><span>' + escapeHtml(clock(event.occurred_at)) + '</span></div></div></div>';
     }).join("");
+  }
+
+
+  function evidenceLabel(type) {
+    return {
+      BOX_OPENED: "药盒开启",
+      BOX_CLOSED: "药盒关闭",
+      WEIGHT_DECREASE_OBSERVED: "重量减少观察",
+      NO_WEIGHT_CHANGE: "重量无变化",
+      EXCESS_REMOVAL_SUSPECTED: "疑似取药过量（需复核）",
+      DEVICE_ERROR: "设备错误",
+      WEIGHT_OBSERVATION: "重量观察"
+    }[type] || type || "—";
+  }
+
+  function evidenceSourceLabel(type) {
+    return {
+      USER_VOICE: "老人语音",
+      USER_BUTTON: "老人按钮",
+      MANUAL_OPERATOR: "人工操作员",
+      DEVICE: "设备",
+      SENSOR: "传感器",
+      CAREGIVER: "护工声明",
+      FAMILY: "家属声明"
+    }[type] || type || "—";
+  }
+
+  function evidenceTarget() {
+    var selected = state.evidenceOccurrenceId;
+    var task = state.tasks.find(function (item) {
+      return item.occurrence_id === selected;
+    });
+    if (task) return task;
+    return state.tasks[0] || null;
+  }
+
+  function renderEvidencePanel() {
+    var panel = byId("evidence-panel");
+    if (!panel) return;
+    var select = byId("evidence-occurrence");
+    var task = evidenceTarget();
+    if (select) {
+      select.innerHTML = state.tasks.length ? state.tasks.map(function (item) {
+        return '<option value="' + escapeHtml(item.occurrence_id) + '"' +
+          (task && item.occurrence_id === task.occurrence_id ? " selected" : "") + ">" +
+          escapeHtml(shortTime(item.scheduled_at) + " · " + reminderLabel(item)) + "</option>";
+      }).join("") : '<option value="">今天暂无 occurrence</option>';
+    }
+    var result = byId("evidence-result");
+    var list = byId("evidence-list");
+    if (!task) {
+      if (result) result.innerHTML = '<div class="event-empty">先生成一条 occurrence，再模拟证据。</div>';
+      if (list) list.innerHTML = "";
+      return;
+    }
+    var latest = state.confirmation && state.confirmation.latest_assessment;
+    if (result) {
+      result.innerHTML = '<div class="evidence-assessment-grid">' +
+        '<div><span>结果</span><strong>' + escapeHtml(latest ? latest.result : "尚无 Assessment") + "</strong></div>" +
+        '<div><span>Basis</span><strong>' + escapeHtml(latest ? latest.basis : "—") + "</strong></div>" +
+        '<div><span>冲突</span><strong>' + escapeHtml(latest && latest.conflict_detected ? "是" : "否") + "</strong></div>" +
+        '<div><span>需复核</span><strong>' + escapeHtml(latest && latest.review_required ? "是" : "否") + "</strong></div>" +
+        "</div>" +
+        '<div class="form-hint">Policy：' + escapeHtml(latest ? latest.policy_version : "confirmation-policy-v1") +
+        " · occurrence 状态：" + escapeHtml(task.intake_status) + "</div>";
+    }
+    if (list) {
+      var items = state.evidence || [];
+      list.innerHTML = items.length ? items.map(function (item) {
+        var raw = "";
+        try { raw = JSON.stringify(item.value || {}); } catch (_) { raw = "{}"; }
+        return '<div class="evidence-row"><div><strong>' + escapeHtml(evidenceLabel(item.evidence_type)) +
+          '</strong><span class="evidence-meta">' + escapeHtml(evidenceSourceLabel(item.source_type)) +
+          " · observed " + escapeHtml(clock(item.observed_at)) + " · received " +
+          escapeHtml(clock(item.received_at)) + "</span></div><div class=\"evidence-value\">" +
+          escapeHtml(raw) + " · " + (item.out_of_window ? "不参与 Assessment" : "参与 Assessment") +
+          "</div></div>";
+      }).join("") : '<div class="event-empty">还没有证据；以下按钮均为“模拟证据”，不代表已连接真实药盒。</div>';
+    }
+  }
+
+  function loadEvidencePanel() {
+    var task = evidenceTarget();
+    if (!task) {
+      state.evidence = [];
+      state.confirmation = null;
+      renderEvidencePanel();
+      return Promise.resolve();
+    }
+    state.evidenceOccurrenceId = task.occurrence_id;
+    return api("/api/v1/medication/occurrences/" + encodeURIComponent(task.occurrence_id) + "/confirmation")
+      .then(function (result) {
+        state.confirmation = result;
+        state.evidence = result.evidence || [];
+        renderEvidencePanel();
+      })
+      .catch(function () {
+        state.evidence = [];
+        state.confirmation = null;
+        renderEvidencePanel();
+      });
+  }
+
+  function simulateEvidence(type) {
+    var task = evidenceTarget();
+    if (!task) {
+      toast("请先生成 occurrence", "error");
+      return;
+    }
+    var source = type === "BOX_OPENED" || type === "BOX_CLOSED" ? "DEVICE" : "SENSOR";
+    var value = { simulated: true };
+    if (type === "WEIGHT_DECREASE_OBSERVED") {
+      value = { simulated: true, raw_before: 10.0, raw_after: 9.5, delta_grams: -0.5, unit: "g" };
+    } else if (type === "NO_WEIGHT_CHANGE") {
+      value = { simulated: true, raw_before: 10.0, raw_after: 10.0, delta_grams: 0, unit: "g" };
+    } else if (type === "EXCESS_REMOVAL_SUSPECTED") {
+      value = { simulated: true, planned_removal: 1, observed_removal: 2 };
+    }
+    post("/api/v1/medication/evidence", {
+      event_id: "web-sim-evidence-" + Date.now(),
+      elder_id: state.elderId,
+      occurrence_id: task.occurrence_id,
+      source_type: source,
+      evidence_type: type,
+      device_id: "simulated-pillbox",
+      value: value
+    }).then(function () {
+      toast("模拟证据已记录；这不代表已连接真实药盒");
+      return refresh();
+    }).catch(function (error) { toast(error.message, "error"); });
   }
 
   function renderAgentStatus(status) {
@@ -710,6 +892,8 @@
         renderPlans();
         renderEvents();
         renderEscalations();
+        renderEvidencePanel();
+        loadEvidencePanel();
         renderWorkflow();
         renderSharedContext();
       })
@@ -732,17 +916,46 @@
 
   function createPlan(event) {
     event.preventDefault();
+    var type = readValue("schedule-type", "FIXED_TIME");
+    var config = {};
+    if (type === "FIXED_TIME") config.times = [readValue("schedule-time")];
+    if (type === "MEAL_RELATION") config = {
+      meal: readValue("schedule-meal"),
+      relation: readValue("schedule-relation"),
+      offset_minutes: Number(readValue("schedule-offset", "0"))
+    };
+    if (type === "INTERVAL") config = {
+      interval_hours: Number(readValue("schedule-interval", "0")),
+      anchor_at: readValue("schedule-anchor")
+    };
+    if (type === "WEEKLY") config = {
+      weekdays: readValue("schedule-weekdays").split(",").map(function (item) { return Number(item.trim()); }),
+      times: [readValue("schedule-weekly-time")]
+    };
+    if (type === "CYCLE") config = {
+      cycle_start_date: readValue("start-date"),
+      days_on: Number(readValue("schedule-days-on", "0")),
+      days_off: Number(readValue("schedule-days-off", "0")),
+      times: [readValue("schedule-cycle-time")]
+    };
+    if (type === "PRN") config = { condition_text: readValue("schedule-condition") };
     var payload = {
       elder_id: state.elderId,
       drug_name: readValue("drug-name"),
       dosage_text: readValue("dosage-text"),
-      schedule_time: readValue("schedule-time"),
+      schedule_type: type,
+      schedule_config: config,
+      schedule_time: config.times ? config.times[0] : null,
       start_date: readValue("start-date"),
       relation_to_meal: readValue("relation-to-meal") || null,
       created_by: readValue("created-by", "family:F001")
     };
-    if (!payload.drug_name || !payload.dosage_text || !payload.schedule_time || !payload.start_date) {
-      toast("请把药品、剂量、时间和开始日期填写完整", "error");
+    var scheduleReady = type === "PRN" ? !!config.condition_text :
+      type === "MEAL_RELATION" ? config.offset_minutes >= 0 :
+      type === "INTERVAL" ? !!config.anchor_at && config.interval_hours > 0 :
+      !!(config.times && config.times[0]);
+    if (!payload.drug_name || !payload.dosage_text || !payload.start_date || !scheduleReady) {
+      toast("请把药品、剂量、明确的 schedule 参数和开始日期填写完整", "error");
       return;
     }
     post("/api/v1/medication/plans/draft", payload)
@@ -888,10 +1101,11 @@
       '<div class="workflow-step" data-step="4"><div class="workflow-index">4</div><div><div class="workflow-title">老人确认</div><div class="workflow-detail">吃了 / 晚点 / 跳过</div></div></div></div></section>';
 
     var escalationPanel = '<section class="card card-elevated escalation-panel" id="escalation-panel"><div class="card-header border-0 pb-0 d-flex justify-content-between align-items-start"><div><div class="section-kicker">M6 · ESCALATION</div><h3 class="card-title mt-1">异常升级</h3><p class="card-caption">未确认事件会按确定性规则通知护工、家属并进入人工复核。</p></div><span class="soft-badge soft-amber">可审计</span></div><div class="card-body pt-3"><div id="escalation-list" class="escalation-list"></div></div></section>';
+    var evidencePanel = '<section class="card card-elevated evidence-panel" id="evidence-panel"><div class="card-header border-0 pb-0 d-flex justify-content-between align-items-start"><div><div class="section-kicker">M5 · MULTI-EVIDENCE</div><h3 class="card-title mt-1">服药证据</h3><p class="card-caption">以下按钮只会写入“模拟证据”，由确定性 M5 Assessment 判断；不代表已连接真实药盒。</p></div><span class="soft-badge soft-blue">模拟入口</span></div><div class="card-body pt-3"><div class="form-row"><div><label class="form-label" for="evidence-occurrence">目标 occurrence</label><select class="form-select" id="evidence-occurrence"><option value="">今天暂无 occurrence</option></select></div><div class="form-hint evidence-sim-hint">BOX_OPENED 和重量变化本身不会直接证明已服药。</div></div><div class="evidence-actions"><button class="btn btn-sm btn-outline-primary" data-evidence-type="BOX_OPENED">模拟药盒开启</button><button class="btn btn-sm btn-outline-primary" data-evidence-type="WEIGHT_DECREASE_OBSERVED">模拟重量减少</button><button class="btn btn-sm btn-outline-secondary" data-evidence-type="NO_WEIGHT_CHANGE">模拟重量无变化</button><button class="btn btn-sm btn-outline-danger" data-evidence-type="EXCESS_REMOVAL_SUSPECTED">模拟异常取药</button></div><div id="evidence-result" class="evidence-result"></div><div id="evidence-list" class="evidence-list"></div></div></section>';
 
     if (state.role === "elder") {
       return '<section class="role-hero elder-hero"><div class="hero-content"><div class="hero-kicker"><span class="pulse-ring"></span>老人端 · 今日陪伴</div><h2>按时吃药，身体会记得这份认真。</h2><p>提醒出现时，点击“吃了”就完成确认；如果还没准备好，也可以选择“晚点”。</p><div class="hero-actions"><button class="btn btn-light" data-action="enable-notifications">开启提醒声音</button><button class="btn btn-ghost-light" data-action="scroll-tasks">看今天的任务</button></div></div><div class="hero-stat"><span class="hero-stat-label" id="hero-stat-label">下一次服用</span><strong id="hero-stat-value">—</strong><span class="hero-stat-note" id="hero-stat-note">正在读取计划</span></div></section>' +
-        reminder + metrics + escalationPanel +
+        reminder + metrics + escalationPanel + evidencePanel +
         '<section class="split-grid elder-grid"><div class="card card-elevated" id="today-tasks"><div class="card-header border-0"><div><div class="section-kicker">TODAY · <span id="today-label">—</span></div><h3 class="card-title mt-1">今天要吃什么</h3></div></div><div class="card-body pt-2"><div id="task-list" class="task-list"></div></div></div>' +
         '<div class="card card-elevated assistant-card"><div class="assistant-intro"><div class="agent-badge"><span class="status-dot" id="agent-status-dot"></span><span id="agent-status-label">智能助手检查中</span></div><div class="section-kicker mt-3">EASY REPLY</div><h3 class="card-title mt-1">也可以直接告诉我</h3><p>例如说“我吃了”，系统会把回复绑定到当前提醒，并同步给家属和医生。</p></div>' +
         agentForm("我吃了", "例如：我吃了，或每天晚上10点提醒我吃药") + '</div></section>' + workflow +
@@ -901,7 +1115,7 @@
 
     if (state.role === "doctor") {
       return '<section class="role-hero doctor-hero"><div class="hero-content"><div class="hero-kicker"><span class="pulse-ring"></span>医生端 · 临床审核</div><h2>让每一份计划，都经得起核对。</h2><p>在审批前确认药品、剂量、时间和服用关系；老人每次反馈后，依从率会实时更新。</p><div class="hero-actions"><button class="btn btn-light" data-action="run-scheduler">▶ 运行一轮调度</button><button class="btn btn-ghost-light" data-action="scroll-plans">查看待审核计划</button></div></div><div class="hero-stat doctor-hero-stat"><span class="hero-stat-label" id="hero-stat-label">待审核计划</span><strong id="hero-stat-value">—</strong><span class="hero-stat-note" id="hero-stat-note">正在读取计划</span></div></section>' +
-        reminder + metrics + escalationPanel +
+        reminder + metrics + escalationPanel + evidencePanel +
         '<section class="split-grid doctor-main"><div class="card card-elevated" id="plan-lifecycle"><div class="card-header border-0 pb-0 d-flex justify-content-between align-items-start"><div><div class="section-kicker">CLINICAL REVIEW</div><h3 class="card-title mt-1">计划审核队列</h3><p class="card-caption">只审批家属提交的计划，生效后系统才会生成任务。</p></div><span class="soft-badge soft-slate" id="plan-count">0 个版本</span></div><div class="doctor-identity"><div><span class="mini-label">当前审核人</span><strong>医生 D001</strong></div><div class="identity-input"><label for="approved-by">审批记录使用</label><input class="form-control" id="approved-by" value="doctor:D001" /></div></div><div class="table-responsive"><table class="table table-vcenter card-table"><thead><tr><th>药品</th><th>时间</th><th>版本</th><th>状态</th><th class="w-1"></th></tr></thead><tbody id="plan-list"></tbody></table></div></div>' +
         '<div class="card card-elevated" id="today-tasks"><div class="card-header border-0 pb-0 d-flex justify-content-between align-items-start"><div><div class="section-kicker">ADHERENCE · <span id="today-label">—</span></div><h3 class="card-title mt-1">今日执行情况</h3><p class="card-caption">查看提醒是否送达，以及老人是否完成确认。</p></div><button class="btn btn-sm btn-ghost-secondary" data-action="refresh">刷新状态</button></div><div class="card-body pt-3"><div id="task-list" class="task-list"></div></div></div></section>' +
         workflow +
@@ -909,8 +1123,8 @@
     }
 
     return '<section class="role-hero family-hero"><div class="hero-content"><div class="hero-kicker"><span class="pulse-ring"></span>家属端 · 照护中枢</div><h2>把复杂的用药安排，变成清楚的下一步。</h2><p>家属创建草稿、提交医生审核；提醒出现后，也可以协助老人记录“吃了、晚点或跳过”。</p><div class="hero-actions"><button class="btn btn-light" data-action="run-scheduler">▶ 运行一轮调度</button><button class="btn btn-ghost-light" data-action="scroll-plan">＋ 新建计划</button></div></div><div class="hero-stat"><span class="hero-stat-label" id="hero-stat-label">待协同计划</span><strong id="hero-stat-value">—</strong><span class="hero-stat-note" id="hero-stat-note">正在读取计划</span></div></section>' +
-      metrics + escalationPanel +
-      '<section class="split-grid family-builder"><div class="card card-elevated" id="plan-editor"><div class="card-header border-0 pb-0"><div><div class="section-kicker">PLAN BUILDER</div><h3 class="card-title mt-1">创建用药计划</h3><p class="card-caption">先保存草稿，再交给医生确认。</p></div><span class="soft-badge soft-blue">Family draft</span></div><div class="card-body pt-3"><form id="plan-form"><div class="mb-3"><label class="form-label" for="drug-name">药品名称</label><input class="form-control" id="drug-name" required value="氨氯地平" placeholder="例如：氨氯地平" /></div><div class="form-row"><div><label class="form-label" for="dosage-text">剂量</label><input class="form-control" id="dosage-text" required value="5mg" placeholder="例如：5mg" /></div><div><label class="form-label" for="schedule-time">每日时间（24小时制）</label><input class="form-control" id="schedule-time" type="time" required /></div></div><div class="form-row"><div><label class="form-label" for="relation-to-meal">服用关系</label><select class="form-select" id="relation-to-meal"><option value="">不指定</option><option value="餐前">餐前</option><option value="餐后" selected>餐后</option></select></div><div><label class="form-label" for="start-date">开始日期（默认今天）</label><input class="form-control" id="start-date" type="date" required /></div></div><div class="form-row"><div><label class="form-label" for="created-by">录入人</label><input class="form-control" id="created-by" value="family:F001" /></div><div><label class="form-label" for="approved-by">协作医生</label><input class="form-control" id="approved-by" value="doctor:D001" /></div></div><div class="form-hint form-hint-box"><span class="hint-dot"></span>固定每日时间 · Asia/Shanghai · 审批后生成未来 7 天任务</div><button class="btn btn-primary w-100 mt-3" type="submit">创建草稿</button></form></div></div>' +
+      metrics + escalationPanel + evidencePanel +
+      '<section class="split-grid family-builder"><div class="card card-elevated" id="plan-editor"><div class="card-header border-0 pb-0"><div><div class="section-kicker">PLAN BUILDER</div><h3 class="card-title mt-1">创建用药计划</h3><p class="card-caption">先保存草稿，再交给医生确认。</p></div><span class="soft-badge soft-blue">Family draft</span></div><div class="card-body pt-3"><form id="plan-form"><div class="mb-3"><label class="form-label" for="drug-name">药品名称</label><input class="form-control" id="drug-name" required value="氨氯地平" placeholder="例如：氨氯地平" /></div><div class="form-row"><div><label class="form-label" for="dosage-text">剂量</label><input class="form-control" id="dosage-text" required value="5mg" placeholder="例如：5mg" /></div><div><label class="form-label" for="schedule-type">计划类型</label><select class="form-select" id="schedule-type"><option value="FIXED_TIME">固定时间</option><option value="MEAL_RELATION">餐前 / 餐后</option><option value="INTERVAL">每 N 小时</option><option value="WEEKLY">每周</option><option value="CYCLE">服 X 天 / 停 Y 天</option><option value="PRN">按需（不自动提醒）</option></select></div></div><div class="form-row"><div id="schedule-time-field"><label class="form-label" for="schedule-time">固定时间</label><input class="form-control" id="schedule-time" type="time" /></div><div id="schedule-meal-field"><label class="form-label" for="schedule-meal">餐次（餐前/餐后类型）</label><select class="form-select" id="schedule-meal"><option value="BREAKFAST">早餐</option><option value="LUNCH">午餐</option><option value="DINNER">晚餐</option></select></div></div><div id="schedule-fields-MEAL_RELATION" class="schedule-fields d-none"><div class="form-row"><div><label class="form-label" for="schedule-relation">关系</label><select class="form-select" id="schedule-relation"><option value="BEFORE">餐前</option><option value="AFTER" selected>餐后</option></select></div><div><label class="form-label" for="schedule-offset">偏移分钟</label><input class="form-control" id="schedule-offset" type="number" min="0" value="30" /></div></div></div><div id="schedule-fields-INTERVAL" class="schedule-fields d-none"><label class="form-label" for="schedule-interval">间隔小时</label><input class="form-control" id="schedule-interval" type="number" min="1" max="168" value="8" /><label class="form-label mt-2" for="schedule-anchor">首次 anchor（Asia/Shanghai）</label><input class="form-control" id="schedule-anchor" type="datetime-local" /></div><div id="schedule-fields-WEEKLY" class="schedule-fields d-none"><label class="form-label" for="schedule-weekdays">ISO 星期（1=周一，7=周日）</label><input class="form-control" id="schedule-weekdays" value="1,3,5" /><label class="form-label mt-2" for="schedule-weekly-time">时间</label><input class="form-control" id="schedule-weekly-time" type="time" value="09:00" /></div><div id="schedule-fields-CYCLE" class="schedule-fields d-none"><div class="form-row"><div><label class="form-label" for="schedule-days-on">服药天数</label><input class="form-control" id="schedule-days-on" type="number" min="1" value="5" /></div><div><label class="form-label" for="schedule-days-off">停药天数</label><input class="form-control" id="schedule-days-off" type="number" min="0" value="2" /></div></div><label class="form-label mt-2" for="schedule-cycle-time">周期时间</label><input class="form-control" id="schedule-cycle-time" type="time" value="08:00" /></div><div id="schedule-fields-PRN" class="schedule-fields d-none"><label class="form-label" for="schedule-condition">触发条件</label><input class="form-control" id="schedule-condition" placeholder="例如：疼痛时" /></div><div class="form-row"><div><label class="form-label" for="created-by">录入人</label><input class="form-control" id="created-by" value="family:F001" /></div><div><label class="form-label" for="approved-by">协作医生</label><input class="form-control" id="approved-by" value="doctor:D001" /></div></div><div class="form-hint form-hint-box"><span class="hint-dot"></span>固定每日时间 · Asia/Shanghai · 审批后生成未来 7 天任务</div><button class="btn btn-primary w-100 mt-3" type="submit">创建草稿</button></form></div></div>' +
       '<div class="card card-elevated" id="today-tasks"><div class="card-header border-0 pb-0 d-flex justify-content-between align-items-start"><div><div class="section-kicker">TODAY · <span id="today-label">—</span></div><h3 class="card-title mt-1">老人今天的任务</h3></div><button class="btn btn-sm btn-ghost-secondary" data-action="refresh">刷新状态</button></div><div class="card-body pt-3"><div id="task-list" class="task-list"></div></div></div></section>' +
       '<section class="card card-elevated agent-card"><div class="agent-layout"><div class="agent-intro"><div class="agent-badge"><span class="status-dot" id="agent-status-dot"></span><span id="agent-status-label">Harness 检查中</span></div><div class="section-kicker mt-3">SEMANTIC ASSISTANT</div><h3 class="agent-title">用自然语言快速建计划</h3><p>说出药品、剂量和时间，系统会把中文时段规范成 24 小时制，并生成一份待医生审核的草稿。</p><div class="agent-examples"><span>每天晚上10点提醒吃氨氯地平5mg</span><span>每天早上8点吃二甲双胍</span></div></div>' + agentForm("例如：每天晚上10点提醒我吃氨氯地平5mg", "例如：每天晚上10点提醒我吃氨氯地平5mg") + '</div><div class="agent-result d-none" id="agent-result"></div></section>' +
       '<section class="split-grid family-bottom"><div class="card card-elevated" id="plan-lifecycle"><div class="card-header border-0 pb-0 d-flex justify-content-between align-items-start"><div><div class="section-kicker">PLAN LIFECYCLE</div><h3 class="card-title mt-1">计划版本与协作状态</h3></div><span class="soft-badge soft-slate" id="plan-count">0 个版本</span></div><div class="table-responsive"><table class="table table-vcenter card-table"><thead><tr><th>药品</th><th>时间</th><th>版本</th><th>状态</th><th class="w-1"></th></tr></thead><tbody id="plan-list"></tbody></table></div></div><div class="card card-elevated"><div class="card-header border-0 pb-0 d-flex justify-content-between align-items-start"><div><div class="section-kicker">AUDIT TRAIL</div><h3 class="card-title mt-1">最近事件</h3></div><span class="soft-badge soft-green">Live</span></div><div class="card-body pt-3"><div id="event-list" class="event-list"></div></div></div></section>' + workflow;
@@ -935,16 +1149,26 @@
       link.setAttribute("aria-current", active ? "page" : "false");
     });
     setDefaults();
+    updateScheduleFields();
     renderMetrics();
     renderHeroState();
     renderTasks();
     renderPlans();
     renderEvents();
     renderEscalations();
+    renderEvidencePanel();
     renderAgentStatus(null);
     renderWorkflow();
     renderSharedContext();
   }
+
+  document.addEventListener("change", function (event) {
+    if (event.target && event.target.id === "schedule-type") updateScheduleFields();
+    if (event.target && event.target.id === "evidence-occurrence") {
+      state.evidenceOccurrenceId = event.target.value;
+      loadEvidencePanel();
+    }
+  });
 
   document.addEventListener("click", function (event) {
     var escalationButton = event.target.closest("[data-escalation-action]");
@@ -963,6 +1187,11 @@
       return;
     }
     var button = event.target.closest("[data-action]");
+    var evidenceButton = event.target.closest("[data-evidence-type]");
+    if (evidenceButton) {
+      simulateEvidence(evidenceButton.getAttribute("data-evidence-type"));
+      return;
+    }
     if (!button) return;
     var action = button.getAttribute("data-action");
     if (action === "refresh") refresh();

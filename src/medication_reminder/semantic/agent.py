@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import re
 
 from ..service import DomainError, SHANGHAI, parse_fast_path
+from ..schedule import ScheduleError, ScheduleType, ScheduleValidator
 from .harness_adapter import HarnessSemanticAdapter
 
 
@@ -43,15 +44,23 @@ class MedicationSemanticAgent:
             raise DomainError("elder_id is required")
         if not str(text or "").strip():
             raise DomainError("text is required")
-
         if interaction_id:
             interaction = self.medication_service.get_open_interaction(
                 elder_id, interaction_id=interaction_id
             )
             if interaction is None:
-                raise DomainError(
-                    "interaction_id is not open or does not belong to elder", 409
+                late_binding = self.medication_service.get_interaction(
+                    elder_id, interaction_id
                 )
+                if not late_binding or late_binding.get("intake_status") != "closed_unconfirmed":
+                    raise DomainError(
+                        "interaction_id is not open or does not belong to elder", 409
+                    )
+                # A closed binding is accepted only for CONFIRM_TAKEN.  The
+                # deterministic service still enforces the exact occurrence
+                # binding and records late verification through M5.
+                interaction = late_binding
+
         else:
             open_interactions = self.medication_service.get_open_interactions(elder_id)
             if len(open_interactions) > 1:
@@ -93,7 +102,12 @@ class MedicationSemanticAgent:
             }
 
         # Do not send ordinary conversational text to the plan extractor.
-        if not any(word in text for word in ("提醒", "每天", "每日", "吃药", "服药", "用药")):
+        if not any(word in text for word in (
+            "提醒", "每天", "每日", "吃药", "服药", "用药", "早餐", "午餐",
+            "晚餐", "餐前", "餐后", "每周", "每隔", "每8", "每 8", "周期",
+            "按需", "PRN", "疼痛时", "一天", "两次", "一次", "每小时",
+            "小时", "隔一段",
+        )):
             return {
                 "kind": "clarification",
                 "message": "当前没有待回应的提醒。请说明药名、剂量和每天的提醒时间。",
@@ -112,9 +126,43 @@ class MedicationSemanticAgent:
             parsed.get("schedule_time") != original_schedule_time
             and parsed.get("schedule_time") is not None
         )
-        required = ("drug_name", "dosage_text", "schedule_time", "start_date")
-        missing = [field for field in required if not parsed.get(field)]
-        missing.extend([field for field in parsed.get("missing_fields", []) if field not in missing])
+
+        explicit_schedule = (
+            parsed.get("schedule_config")
+            or parsed.get("schedule")
+            or parsed.get("schedule_time")
+        )
+        missing = [
+            field for field in ("drug_name", "dosage_text", "start_date")
+            if not parsed.get(field)
+        ]
+        if not explicit_schedule:
+            missing.append("schedule_config")
+        if missing:
+            missing.extend(
+                field for field in (parsed.get("missing_fields") or [])
+                if field not in missing and field != "start_date"
+            )
+            return {
+                "kind": "plan_clarification",
+                "missing_fields": missing,
+                "draft": parsed,
+                "message": "还需要确认：%s。" % "、".join(missing),
+            }
+
+        try:
+            schedule_type, schedule_config = ScheduleValidator.validate_plan(parsed)
+        except ScheduleError as exc:
+            raise DomainError(exc.code, 422, dict(exc.details, code=exc.code)) from exc
+        parsed["schedule_type"] = schedule_type
+        parsed["schedule_config"] = schedule_config
+        if schedule_type == ScheduleType.FIXED_TIME:
+            parsed["schedule_time"] = schedule_config["times"][0]
+
+        missing.extend(
+            field for field in (parsed.get("missing_fields") or [])
+            if field not in missing and field != "start_date"
+        )
         if missing:
             return {
                 "kind": "plan_clarification",
@@ -122,11 +170,14 @@ class MedicationSemanticAgent:
                 "draft": parsed,
                 "message": "还需要确认：%s。" % "、".join(missing),
             }
+
         draft = self.medication_service.create_draft({
             "elder_id": elder_id,
             "drug_name": parsed["drug_name"],
             "dosage_text": parsed["dosage_text"],
-            "schedule_time": parsed["schedule_time"],
+            "schedule_type": schedule_type,
+            "schedule_config": schedule_config,
+            "schedule_time": parsed.get("schedule_time"),
             "relation_to_meal": parsed.get("relation_to_meal"),
             "route": parsed.get("route") or "oral",
             "timezone": "Asia/Shanghai",
@@ -134,11 +185,15 @@ class MedicationSemanticAgent:
             "created_by": created_by or source,
             "source": "deepseek_harness",
         })
+        message = "已生成用药计划草稿，审批后才会进入调度。"
+        if schedule_type in (ScheduleType.MEAL_RELATION, ScheduleType.ROUTINE_RELATION):
+            if self.medication_service.get_routine(elder_id) is None:
+                message += " 当前餐次/睡前时间尚未提供，补充作息后才能审批。"
         return {
             "kind": "plan_draft_created",
             "draft": draft,
             "start_date_defaulted": start_date_defaulted,
             "schedule_time_normalized": schedule_time_normalized,
-            "message": "已生成用药计划草稿，审批后才会进入调度。",
+            "message": message,
         }
 

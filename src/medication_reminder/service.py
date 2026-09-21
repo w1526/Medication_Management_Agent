@@ -2,6 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, time, timedelta, timezone
+import hashlib
 import json
 import os
 import re
@@ -9,6 +10,15 @@ import uuid
 
 from .config import load_local_env
 from .device_adapter import DeviceAdapterError, build_device_adapter
+from .confirmation import (
+    ASSESSMENT_RESULTS,
+    EVIDENCE_TYPES,
+    POLICY_VERSION,
+    SOURCE_TYPES,
+    TAKEN_EVIDENCE_TYPES,
+    assess as assess_confirmation_evidence,
+    policy_fingerprint as confirmation_policy_fingerprint,
+)
 from .escalation import (
     ALL_LEVELS,
     ALL_STATUSES,
@@ -26,6 +36,13 @@ from .escalation import (
     target_role,
 )
 from .storage import Storage
+from .routine import ElderRoutine, RoutineError
+from .schedule import (
+    ScheduleError,
+    ScheduleExpander,
+    ScheduleType,
+    ScheduleValidator,
+)
 from .safety import (
     SafetyCheckResult,
     SafetyFinding,
@@ -179,6 +196,24 @@ class MedicationService:
             "default_delay_minutes": 30,
             "interaction_ttl_minutes": 30,
             "outbox_lease_seconds": 60,
+            # M5 values are engineering policy defaults, not clinical
+            # parameters.  They are persisted on every assessment so a later
+            # policy change cannot silently rewrite historical conclusions.
+            "confirmation_policy_version": os.environ.get(
+                "CONFIRMATION_POLICY_VERSION", POLICY_VERSION
+            ),
+            "confirmation_policy_fingerprint": os.environ.get(
+                "CONFIRMATION_POLICY_FINGERPRINT", confirmation_policy_fingerprint()
+            ),
+            "evidence_pre_window_minutes": _env_int(
+                "EVIDENCE_PRE_WINDOW_MINUTES", 120
+            ),
+            "evidence_post_window_minutes": _env_int(
+                "EVIDENCE_POST_WINDOW_MINUTES", 120
+            ),
+            "evidence_clock_skew_seconds": _env_int(
+                "EVIDENCE_CLOCK_SKEW_SECONDS", 300
+            ),
             "device_adapter": os.environ.get("MEDICATION_DEVICE_ADAPTER", "local"),
             "chat_agent_base_url": os.environ.get("CHAT_AGENT_BASE_URL", ""),
             "chat_agent_reminder_path": os.environ.get("CHAT_AGENT_REMINDER_PATH", ""),
@@ -229,6 +264,13 @@ class MedicationService:
         self.safety_engine = build_safety_engine(self.config)
         self.safety_ruleset_version = self.safety_engine.ruleset_version
         self.safety_ruleset_fingerprint = self.safety_engine.ruleset_fingerprint
+        self.confirmation_policy_version = str(
+            self.config.get("confirmation_policy_version") or POLICY_VERSION
+        )
+        self.confirmation_policy_fingerprint = str(
+            self.config.get("confirmation_policy_fingerprint") or confirmation_policy_fingerprint()
+        )
+        self.schedule_expander = ScheduleExpander(SUPPORTED_TIMEZONE)
         self.device_adapter = device_adapter or build_device_adapter(self.config)
         # Read-only dashboard queries can use independent SQLite connections.
         self.read_executor = ThreadPoolExecutor(
@@ -310,6 +352,519 @@ class MedicationService:
             (event_id,),
         ).fetchone()
         return row is not None
+
+    # ---------- M5 evidence and confirmation ----------
+
+    @staticmethod
+    def _normalize_evidence_source(value):
+        normalized = str(value or "").strip().upper().replace("-", "_")
+        aliases = {
+            "VOICE": "USER_VOICE",
+            "BUTTON": "USER_BUTTON",
+            "MANUAL": "MANUAL_OPERATOR",
+        }
+        return aliases.get(normalized, normalized)
+
+    @staticmethod
+    def _normalize_evidence_type(value):
+        return str(value or "").strip().upper().replace("-", "_")
+
+    @staticmethod
+    def _evidence_value(data):
+        if "value" in data:
+            value = data.get("value")
+        elif "value_json" in data:
+            value = data.get("value_json")
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise DomainError("value_json must contain valid JSON", 422) from exc
+        else:
+            value = {}
+            for key in (
+                "raw_before", "raw_after", "delta", "delta_grams", "unit",
+                "normalized", "text", "action", "late_verified_source",
+                "late_verified_note", "confirmation_method",
+            ):
+                if key in data:
+                    value[key] = data[key]
+        if value is None:
+            value = {}
+        try:
+            json_text(value)
+        except (TypeError, ValueError) as exc:
+            raise DomainError("value must be JSON serializable", 422) from exc
+        return value
+
+    def _evidence_binding_in_transaction(self, connection, data):
+        occurrence_id = str(data.get("occurrence_id") or "").strip()
+        interaction_id = str(data.get("interaction_id") or "").strip() or None
+        if not occurrence_id and interaction_id:
+            interaction = connection.execute(
+                "SELECT * FROM medication_interaction WHERE interaction_id=?",
+                (interaction_id,),
+            ).fetchone()
+            if interaction is None:
+                raise DomainError("interaction not found", 404)
+            occurrence_id = interaction["occurrence_id"]
+        if not occurrence_id:
+            raise DomainError("occurrence_id is required")
+        occurrence = connection.execute(
+            "SELECT * FROM medication_occurrence WHERE occurrence_id=?",
+            (occurrence_id,),
+        ).fetchone()
+        if occurrence is None:
+            raise DomainError("occurrence not found", 404)
+        if data.get("elder_id") and data["elder_id"] != occurrence["elder_id"]:
+            raise DomainError("elder_id does not match occurrence", 409)
+        if interaction_id:
+            interaction = connection.execute(
+                "SELECT * FROM medication_interaction WHERE interaction_id=?",
+                (interaction_id,),
+            ).fetchone()
+            if interaction is None:
+                raise DomainError("interaction not found", 404)
+            if interaction["occurrence_id"] != occurrence_id:
+                raise DomainError("interaction_id does not match occurrence", 409)
+            if data.get("elder_id") and data["elder_id"] != interaction["elder_id"]:
+                raise DomainError("elder_id does not match interaction", 409)
+        return occurrence, interaction_id
+
+    def _evidence_window_flags(self, occurrence, observed_at):
+        pre_minutes = max(0, int(self.config.get("evidence_pre_window_minutes", 120)))
+        post_minutes = max(0, int(self.config.get("evidence_post_window_minutes", 120)))
+        start = parse_datetime(occurrence["scheduled_at"]) - timedelta(minutes=pre_minutes)
+        end = parse_datetime(occurrence["confirmation_deadline_at"]) + timedelta(minutes=post_minutes)
+        return observed_at < start or observed_at > end
+
+    @staticmethod
+    def _hydrate_evidence(row):
+        if row is None:
+            return None
+        item = row_dict(row)
+        try:
+            item["value"] = json.loads(item.pop("value_json"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            item["value"] = {}
+            item.pop("value_json", None)
+        for key in ("identity_trusted", "source_trusted", "out_of_window", "invalid"):
+            item[key] = bool(item.get(key, 0))
+        return item
+
+    @staticmethod
+    def _hydrate_assessment(row):
+        if row is None:
+            return None
+        item = row_dict(row)
+        try:
+            item["evidence_ids"] = json.loads(item.pop("evidence_ids_json"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            item["evidence_ids"] = []
+            item.pop("evidence_ids_json", None)
+        for key in ("conflict_detected", "review_required", "late"):
+            item[key] = bool(item.get(key, 0))
+        return item
+
+    def _record_evidence_in_transaction(self, connection, data, *, assess=True,
+                                        identity_trusted=False, source_trusted=False,
+                                        require_event_id=True, received_at=None):
+        data = dict(data or {})
+        event_id = str(data.get("event_id") or "").strip()
+        if require_event_id and not event_id:
+            raise DomainError("event_id is required for medication evidence")
+        if not event_id:
+            event_id = new_id("evidence_evt")
+        source_type = self._normalize_evidence_source(data.get("source_type"))
+        evidence_type = self._normalize_evidence_type(data.get("evidence_type"))
+        if source_type not in SOURCE_TYPES:
+            raise DomainError("unsupported evidence source_type", 422)
+        if evidence_type not in EVIDENCE_TYPES:
+            if evidence_type == "OVERDOSE_CONFIRMED":
+                raise DomainError("OVERDOSE_CONFIRMED is not supported by M5", 422)
+            raise DomainError("unsupported evidence_type", 422)
+
+        existing = connection.execute(
+            "SELECT * FROM medication_evidence WHERE event_id=?", (event_id,)
+        ).fetchone()
+        if existing is not None:
+            if data.get("occurrence_id") and data["occurrence_id"] != existing["occurrence_id"]:
+                raise DomainError("event_id is already bound to another occurrence", 409)
+            if data.get("elder_id") and data["elder_id"] != existing["elder_id"]:
+                raise DomainError("event_id is already bound to another elder", 409)
+            if self._normalize_evidence_type(data.get("evidence_type")) != existing["evidence_type"]:
+                raise DomainError("event_id is already used by another evidence type", 409)
+            assessment = connection.execute(
+                """SELECT * FROM medication_confirmation_assessment
+                   WHERE occurrence_id=? ORDER BY assessed_at DESC, created_at DESC
+                   LIMIT 1""",
+                (existing["occurrence_id"],),
+            ).fetchone()
+            return {
+                "duplicate": True,
+                "evidence": existing,
+                "assessment": assessment,
+                "occurrence_id": existing["occurrence_id"],
+                "late": bool(assessment and assessment["late"]),
+            }
+        logged = connection.execute(
+            "SELECT event_type FROM medication_event_log WHERE event_id=?", (event_id,)
+        ).fetchone()
+        if logged is not None:
+            raise DomainError("event_id is already used by another event", 409)
+
+        occurrence, interaction_id = self._evidence_binding_in_transaction(connection, data)
+        clock = received_at or now_utc()
+        observed_at = parse_datetime(data["observed_at"]) if data.get("observed_at") else clock
+        skew_seconds = max(0, int(self.config.get("evidence_clock_skew_seconds", 300)))
+        if observed_at > clock + timedelta(seconds=skew_seconds):
+            raise DomainError(
+                "observed_at is too far in the future", 422,
+                {"observed_at": iso(observed_at), "received_at": iso(clock),
+                 "clock_skew_seconds": skew_seconds},
+            )
+        if source_type == "USER_VOICE" and not interaction_id:
+            raise DomainError("USER_VOICE evidence requires a trusted interaction_id", 409)
+        if occurrence["intake_status"] == UNCONFIRMED and evidence_type in TAKEN_EVIDENCE_TYPES:
+            if parse_datetime(occurrence["confirmation_deadline_at"]) <= clock:
+                raise DomainError(
+                    "confirmation window is closed; run scheduler before late verification",
+                    409,
+                )
+        value = self._evidence_value(data)
+        out_of_window = self._evidence_window_flags(occurrence, observed_at)
+        trace_id = str(data.get("trace_id") or "evidence:%s" % event_id)
+        evidence_id = str(data.get("evidence_id") or new_id("evidence"))
+        actor_id = str(data.get("actor_id") or "").strip() or None
+        actor_role = str(data.get("actor_role") or "").strip() or None
+        device_id = str(data.get("device_id") or "").strip() or None
+        created_at = iso(clock)
+        connection.execute(
+            """INSERT INTO medication_evidence
+               (evidence_id, event_id, elder_id, occurrence_id, interaction_id,
+                source_type, evidence_type, value_json, observed_at, received_at,
+                actor_id, actor_role, device_id, identity_trusted, source_trusted,
+                trace_id, out_of_window, invalid, invalid_reason, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?)""",
+            (
+                evidence_id, event_id, occurrence["elder_id"], occurrence["occurrence_id"],
+                interaction_id, source_type, evidence_type, json_text(value), iso(observed_at),
+                iso(clock), actor_id, actor_role, device_id, int(bool(identity_trusted)),
+                int(bool(source_trusted)), trace_id, int(bool(out_of_window)), created_at,
+            ),
+        )
+        evidence_event = self._event(
+            "medication.evidence.recorded", "m5_evidence",
+            elder_id=occurrence["elder_id"], plan_id=occurrence["plan_id"],
+            occurrence_id=occurrence["occurrence_id"], payload={
+                "evidence_id": evidence_id, "event_id": event_id,
+                "interaction_id": interaction_id, "source_type": source_type,
+                "evidence_type": evidence_type, "value": value,
+                "observed_at": iso(observed_at), "received_at": iso(clock),
+                "actor_id": actor_id, "actor_role": actor_role, "device_id": device_id,
+                "identity_trusted": bool(identity_trusted),
+                "source_trusted": bool(source_trusted),
+                "out_of_window": bool(out_of_window), "trace_id": trace_id,
+            },
+            occurred_at=observed_at, event_id=event_id, trace_id=trace_id,
+        )
+        self._audit_and_enqueue(connection, evidence_event, "evidence:%s" % evidence_id)
+
+        assessment = None
+        late = bool(
+            occurrence["intake_status"] == "closed_unconfirmed"
+            and evidence_type in TAKEN_EVIDENCE_TYPES and not out_of_window
+        )
+        if assess and not out_of_window:
+            assessment = self._create_confirmation_assessment_in_transaction(
+                connection, occurrence, trace_id=trace_id, assessed_at=clock, late=late
+            )
+        return {
+            "duplicate": False,
+            "evidence": connection.execute(
+                "SELECT * FROM medication_evidence WHERE evidence_id=?", (evidence_id,)
+            ).fetchone(),
+            "assessment": assessment,
+            "occurrence_id": occurrence["occurrence_id"],
+            "late": late,
+        }
+
+    def _create_confirmation_assessment_in_transaction(self, connection, occurrence,
+                                                        trace_id, assessed_at, late=False):
+        rows = connection.execute(
+            """SELECT * FROM medication_evidence
+               WHERE occurrence_id=? AND invalid=0 AND out_of_window=0
+               ORDER BY observed_at, created_at, evidence_id""",
+            (occurrence["occurrence_id"],),
+        ).fetchall()
+        policy = assess_confirmation_evidence([row_dict(row) for row in rows])
+        if not policy["evidence_ids"]:
+            return None
+        assessment_id = new_id("assessment")
+        assessment_late = bool(
+            late or (
+                occurrence["intake_status"] == "closed_unconfirmed"
+                and any(item["evidence_type"] in TAKEN_EVIDENCE_TYPES for item in rows)
+            )
+        )
+        created_at = iso(assessed_at)
+        connection.execute(
+            """INSERT INTO medication_confirmation_assessment
+               (assessment_id, occurrence_id, result, basis, policy_version,
+                policy_fingerprint, evidence_ids_json, conflict_detected,
+                review_required, late, assessed_at, trace_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                assessment_id, occurrence["occurrence_id"], policy["result"],
+                policy["basis"], self.confirmation_policy_version,
+                self.confirmation_policy_fingerprint, json_text(policy["evidence_ids"]),
+                int(bool(policy["conflict_detected"])), int(bool(policy["review_required"])),
+                int(assessment_late), iso(assessed_at), trace_id, created_at,
+            ),
+        )
+        assessment_payload = {
+            "assessment_id": assessment_id,
+            "occurrence_id": occurrence["occurrence_id"],
+            "result": policy["result"],
+            "basis": policy["basis"],
+            "policy_version": self.confirmation_policy_version,
+            "policy_fingerprint": self.confirmation_policy_fingerprint,
+            "evidence_ids": policy["evidence_ids"],
+            "conflict_detected": bool(policy["conflict_detected"]),
+            "review_required": bool(policy["review_required"]),
+            "late": assessment_late,
+            "trace_id": trace_id,
+        }
+        assessed_event = self._event(
+            "medication.confirmation.assessed", "m5_confirmation",
+            elder_id=occurrence["elder_id"], plan_id=occurrence["plan_id"],
+            occurrence_id=occurrence["occurrence_id"], payload=assessment_payload,
+            occurred_at=assessed_at, trace_id=trace_id,
+        )
+        self._audit_and_enqueue(
+            connection, assessed_event,
+            "confirmation_assessed:%s" % assessment_id,
+        )
+        if policy["result"] == "CONFIRMED":
+            confirmed_event = self._event(
+                "medication.confirmation.confirmed", "m5_confirmation",
+                elder_id=occurrence["elder_id"], plan_id=occurrence["plan_id"],
+                occurrence_id=occurrence["occurrence_id"], payload=assessment_payload,
+                occurred_at=assessed_at, trace_id=trace_id,
+            )
+            self._audit_and_enqueue(
+                connection, confirmed_event,
+                "confirmation_confirmed:%s" % assessment_id,
+            )
+        if policy["conflict_detected"]:
+            conflict_event = self._event(
+                "medication.confirmation.conflict_detected", "m5_confirmation",
+                elder_id=occurrence["elder_id"], plan_id=occurrence["plan_id"],
+                occurrence_id=occurrence["occurrence_id"], payload=assessment_payload,
+                occurred_at=assessed_at, trace_id=trace_id,
+            )
+            self._audit_and_enqueue(
+                connection, conflict_event,
+                "confirmation_conflict:%s" % assessment_id,
+            )
+        if policy["review_required"]:
+            review_event = self._event(
+                "medication.confirmation.review_required", "m5_confirmation",
+                elder_id=occurrence["elder_id"], plan_id=occurrence["plan_id"],
+                occurrence_id=occurrence["occurrence_id"], payload=assessment_payload,
+                occurred_at=assessed_at, trace_id=trace_id,
+            )
+            self._audit_and_enqueue(
+                connection, review_event,
+                "confirmation_review:%s" % assessment_id,
+            )
+            manual_review = self._event(
+                "manual_review.request", "m5_confirmation",
+                elder_id=occurrence["elder_id"], plan_id=occurrence["plan_id"],
+                occurrence_id=occurrence["occurrence_id"], payload=dict(
+                    assessment_payload,
+                    review_reason=(
+                        "EXCESS_REMOVAL_SUSPECTED"
+                        if policy["has_excess_removal"] else "EVIDENCE_CONFLICT"
+                    ),
+                    m6_action="MANUAL_REVIEW",
+                ),
+                occurred_at=assessed_at, trace_id=trace_id,
+            )
+            self._audit_and_enqueue(
+                connection, manual_review,
+                "m5_manual_review:%s" % assessment_id,
+            )
+        self._apply_confirmation_assessment_in_transaction(
+            connection, occurrence, policy, assessment_id, rows, assessment_late,
+            assessed_at, trace_id,
+        )
+        return connection.execute(
+            "SELECT * FROM medication_confirmation_assessment WHERE assessment_id=?",
+            (assessment_id,),
+        ).fetchone()
+
+    def _apply_confirmation_assessment_in_transaction(self, connection, occurrence,
+                                                       policy, assessment_id, evidence_rows,
+                                                       late, assessed_at, trace_id):
+        if policy["result"] != "CONFIRMED":
+            return
+        current = connection.execute(
+            "SELECT * FROM medication_occurrence WHERE occurrence_id=?",
+            (occurrence["occurrence_id"],),
+        ).fetchone()
+        strong = [
+            row for row in evidence_rows
+            if row["evidence_type"] in TAKEN_EVIDENCE_TYPES
+        ]
+        if not strong:
+            return
+        chosen = sorted(strong, key=lambda row: (row["observed_at"], row["created_at"]))[-1]
+        chosen_value = json.loads(chosen["value_json"])
+        method = {
+            "SELF_REPORTED_TAKEN": "voice",
+            "BUTTON_CONFIRMED": "button",
+            "MANUAL_REPORTED_TAKEN": "manual",
+        }.get(chosen["evidence_type"], "m5")
+        if current["intake_status"] == UNCONFIRMED:
+            cursor = connection.execute(
+                """UPDATE medication_occurrence
+                   SET intake_status='confirmed_taken', actual_time=?,
+                       confirmation_method=?, reminder_claimed_at=NULL, updated_at=?
+                   WHERE occurrence_id=? AND intake_status='unconfirmed'""",
+                (chosen["observed_at"], method, iso(assessed_at), occurrence["occurrence_id"]),
+            )
+            if cursor.rowcount != 1:
+                raise DomainError("occurrence state changed concurrently", 409)
+            connection.execute(
+                """UPDATE medication_interaction SET status='closed', updated_at=?
+                   WHERE occurrence_id=? AND status='open'""",
+                (iso(assessed_at), occurrence["occurrence_id"]),
+            )
+            payload = {
+                "occurrence_id": occurrence["occurrence_id"],
+                "assessment_id": assessment_id,
+                "status": "confirmed_taken",
+                "actual_time": chosen["observed_at"],
+                "confirmation_method": method,
+                "basis": policy["basis"],
+                "evidence_ids": policy["evidence_ids"],
+                "late": False,
+                "trace_id": trace_id,
+            }
+            event = self._event(
+                "medication.intake.updated", "m5_confirmation",
+                elder_id=occurrence["elder_id"], plan_id=occurrence["plan_id"],
+                occurrence_id=occurrence["occurrence_id"], payload=payload,
+                occurred_at=parse_datetime(chosen["observed_at"]), trace_id=trace_id,
+            )
+            self._audit_and_enqueue(
+                connection, event,
+                "m5_intake_confirmed:%s" % assessment_id,
+            )
+        elif current["intake_status"] == "closed_unconfirmed" and late:
+            late_source = str(
+                chosen_value.get("late_verified_source")
+                or chosen["actor_role"]
+                or chosen["source_type"]
+            ).strip()
+            late_note = str(chosen_value.get("late_verified_note") or "").strip() or None
+            cursor = connection.execute(
+                """UPDATE medication_occurrence
+                   SET late_verified_taken_at=?, late_verified_by=?,
+                       late_verified_source=?, late_verified_note=?, updated_at=?
+                   WHERE occurrence_id=? AND intake_status='closed_unconfirmed'""",
+                (
+                    chosen["observed_at"], chosen["actor_id"], late_source, late_note,
+                    iso(assessed_at), occurrence["occurrence_id"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise DomainError("occurrence state changed concurrently", 409)
+            payload = {
+                "occurrence_id": occurrence["occurrence_id"],
+                "assessment_id": assessment_id,
+                "status": "closed_unconfirmed",
+                "late": True,
+                "late_verified_taken": True,
+                "late_verified_taken_at": chosen["observed_at"],
+                "late_verified_by": chosen["actor_id"],
+                "late_verified_source": late_source,
+                "late_verified_note": late_note,
+                "basis": policy["basis"],
+                "evidence_ids": policy["evidence_ids"],
+                "trace_id": trace_id,
+            }
+            event = self._event(
+                "medication.intake.late_verified", "m5_confirmation",
+                elder_id=occurrence["elder_id"], plan_id=occurrence["plan_id"],
+                occurrence_id=occurrence["occurrence_id"], payload=payload,
+                occurred_at=parse_datetime(chosen["observed_at"]), trace_id=trace_id,
+            )
+            self._audit_and_enqueue(
+                connection, event,
+                "m5_late_verified:%s" % assessment_id,
+            )
+
+    def record_evidence(self, data=None):
+        """Record one immutable Evidence and run M5 when it is in-window."""
+
+        data = dict(data or {})
+        if not str(data.get("event_id") or "").strip():
+            raise DomainError("event_id is required for medication evidence")
+        if not str(data.get("elder_id") or "").strip():
+            raise DomainError("elder_id is required for medication evidence")
+        with self.storage.transaction() as connection:
+            result = self._record_evidence_in_transaction(connection, data)
+        evidence = self._hydrate_evidence(result["evidence"])
+        assessment = self._hydrate_assessment(result["assessment"])
+        occurrence = self.get_occurrence(result["occurrence_id"])
+        return {
+            "duplicate": result["duplicate"],
+            "evidence": evidence,
+            "assessment": assessment,
+            "occurrence": occurrence,
+            "late": bool(result["late"]),
+        }
+
+    # Explicit alias for callers that prefer the domain name.
+    record_medication_evidence = record_evidence
+
+    def list_evidence(self, occurrence_id):
+        self.get_occurrence(occurrence_id)
+        rows = self.storage.fetchall(
+            "SELECT * FROM medication_evidence WHERE occurrence_id=? ORDER BY observed_at, created_at, evidence_id",
+            (occurrence_id,),
+        )
+        return [self._hydrate_evidence(row) for row in rows]
+
+    def list_confirmation_assessments(self, occurrence_id):
+        self.get_occurrence(occurrence_id)
+        rows = self.storage.fetchall(
+            """SELECT * FROM medication_confirmation_assessment
+               WHERE occurrence_id=? ORDER BY assessed_at, created_at, assessment_id""",
+            (occurrence_id,),
+        )
+        return [self._hydrate_assessment(row) for row in rows]
+
+    def get_confirmation(self, occurrence_id):
+        occurrence = self.get_occurrence(occurrence_id)
+        evidence = self.list_evidence(occurrence_id)
+        history = self.list_confirmation_assessments(occurrence_id)
+        latest = history[-1] if history else None
+        return {
+            "occurrence_id": occurrence_id,
+            "intake_status": occurrence["intake_status"],
+            "confirmation_basis": latest.get("basis") if latest else None,
+            "evidence_count": len(evidence),
+            "evidence_conflict": bool(latest and latest.get("conflict_detected")),
+            "review_required": bool(latest and latest.get("review_required")),
+            "latest_assessment": latest,
+            "assessment_history": history,
+            "evidence": evidence,
+            "policy_version": self.confirmation_policy_version,
+            "policy_fingerprint": self.confirmation_policy_fingerprint,
+        }
 
     # ---------- M2 safety check and audit persistence ----------
 
@@ -579,7 +1134,7 @@ class MedicationService:
         return self._run_safety_check_in_transaction(connection, plan, clock)
 
     def _attach_plan_safety(self, plan):
-        item = dict(plan)
+        item = self._normalize_plan_row(plan)
         check = self.get_latest_safety_check(item["plan_id"], item["version"])
         item["safety_status"] = check["status"] if check else "NOT_CHECKED"
         item["latest_safety_check_id"] = check["check_id"] if check else None
@@ -619,28 +1174,159 @@ class MedicationService:
             self._run_safety_check_in_transaction(connection, plan, clock, trace_id)
         return self.get_latest_safety_check(plan_id, plan["version"])
 
+    # ---------- deterministic schedule helpers ----------
+
+    def _schedule_domain_error(self, error, status=None):
+        if isinstance(error, ScheduleError):
+            details = dict(error.details)
+            details.setdefault("code", error.code)
+            return DomainError(error.code, status or (
+                409 if error.code == "SCHEDULE_CONTEXT_MISSING" else 422
+            ), details)
+        return error
+
+    def _normalize_plan_row(self, row):
+        item = dict(row or {})
+        raw_config = item.get("schedule_config_json")
+        config = None
+        if raw_config:
+            try:
+                config = json.loads(raw_config) if isinstance(raw_config, str) else raw_config
+            except (TypeError, ValueError, json.JSONDecodeError):
+                config = None
+        if not isinstance(config, dict):
+            config = {}
+        try:
+            schedule_type, config = ScheduleValidator.validate(
+                item.get("schedule_type"), config,
+                schedule_time=item.get("schedule_time") or item.get("time"),
+            )
+        except ScheduleError as exc:
+            legacy_type = str(item.get("schedule_type") or "").strip().upper()
+            if raw_config or legacy_type not in ("", "DAILY", "FIXED_TIME"):
+                raise self._schedule_domain_error(exc) from exc
+            # A pre-Phase-4 row may have schedule_type=daily and only
+            # schedule_time.  Its legacy value remains the sole source of
+            # truth; do not invent another daily time.
+            schedule_type, config = ScheduleValidator.validate(
+                ScheduleType.FIXED_TIME,
+                {"times": [item.get("schedule_time") or item.get("time")]},
+            )
+        item["schedule_type"] = schedule_type
+        item["schedule_config"] = config
+        item["schedule"] = dict(config)
+        item["schedule_snapshot"] = {"type": schedule_type, **dict(config)}
+        if schedule_type == ScheduleType.FIXED_TIME and config.get("times"):
+            item["schedule_time"] = config["times"][0]
+        return item
+
+    def _schedule_bundle(self, plan):
+        normalized = self._normalize_plan_row(plan)
+        return normalized["schedule_type"], normalized["schedule_config"]
+
+    def _routine_in_transaction(self, connection, elder_id):
+        row = connection.execute(
+            "SELECT * FROM elder_routine WHERE elder_id=?", (elder_id,)
+        ).fetchone()
+        return ElderRoutine.from_mapping(dict(row)) if row else None
+
+    def _assert_schedule_ready_in_transaction(self, connection, plan):
+        plan = self._normalize_plan_row(plan)
+        try:
+            schedule_type, config = self._schedule_bundle(plan)
+            if schedule_type == ScheduleType.PRN:
+                return None
+            routine = None
+            if schedule_type in (
+                ScheduleType.MEAL_RELATION, ScheduleType.ROUTINE_RELATION
+            ):
+                routine = self._routine_in_transaction(connection, plan["elder_id"])
+            self.schedule_expander.expand(
+                plan=dict(plan, schedule_type=schedule_type,
+                          schedule_config=config),
+                start=plan["start_date"],
+                end=plan["start_date"],
+                routine=routine,
+            )
+            return routine
+        except ScheduleError as exc:
+            raise self._schedule_domain_error(exc) from exc
+
+    def _routine_for_plan_in_transaction(self, connection, plan):
+        schedule_type, _config = self._schedule_bundle(plan)
+        if schedule_type in (
+            ScheduleType.MEAL_RELATION, ScheduleType.ROUTINE_RELATION
+        ):
+            return self._routine_in_transaction(connection, plan["elder_id"])
+        return None
+
+    def _occurrence_identity(self, plan, scheduled_at):
+        identity = "%s|%s|%s" % (
+            plan["plan_id"], int(plan["version"]), iso(scheduled_at)
+        )
+        return "occ_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
+
+    def _schedule_source_snapshot(self, spec):
+        return json_text({
+            "type": spec.schedule_type,
+            "config": spec.schedule_snapshot,
+            "timezone": spec.timezone,
+            "source": spec.schedule_source,
+        })
+
+    def _expand_plan_specs_in_transaction(self, connection, plan, clock,
+                                          horizon_days=None):
+        plan = self._normalize_plan_row(plan)
+        routine = self._routine_for_plan_in_transaction(connection, plan)
+        horizon = int(horizon_days or self.config["occurrence_window_days"])
+        window_start = clock.astimezone(SHANGHAI)
+        plan_start = datetime.combine(
+            parse_date(plan["start_date"], "start_date"), time.min, tzinfo=SHANGHAI
+        )
+        window_start = max(window_start, plan_start)
+        window_end = window_start + timedelta(days=horizon)
+        try:
+            return self.schedule_expander.expand(
+                plan=plan,
+                start=window_start,
+                end=window_end,
+                routine=routine,
+            )
+        except ScheduleError as exc:
+            raise self._schedule_domain_error(exc) from exc
+
     # ---------- plan lifecycle ----------
 
     def _validate_plan_fields(self, data, defaults=None):
         defaults = defaults or {}
+        incoming = dict(data or {})
         merged = dict(defaults)
-        merged.update(data or {})
-        # The domain validator keeps the draft shape usable.  M2 owns the
-        # final safety-sensitive medication/name/dose findings at submission
-        # approval time, so malformed drafts remain auditable instead of being
-        # silently turned into an uncheckable failure.
-        required = ("elder_id", "schedule_time", "start_date")
+        merged.update(incoming)
+        # A revision may use either the new object form or the legacy
+        # schedule_time field.  Do not let the inherited canonical config
+        # silently win over an explicit schedule change.
+        schedule_fields = {
+            "schedule_type", "schedule", "schedule_config", "schedule_time", "time",
+            "times", "meal", "relation", "offset_minutes", "interval_hours", "hours",
+            "anchor_at", "weekdays", "cycle_start_date", "days_on", "days_off",
+            "condition_text", "anchor",
+        }
+        if "schedule_config" not in incoming and (
+            "schedule" in incoming or schedule_fields.intersection(incoming)
+        ):
+            merged.pop("schedule_config", None)
+            if "schedule" not in incoming:
+                merged.pop("schedule", None)
+        required = ("elder_id", "start_date")
         for field in required:
             if not str(merged.get(field, "")).strip():
                 raise DomainError("missing required field: %s" % field)
-        if merged.get("schedule_type", "daily") != "daily":
-            raise DomainError("MVP only supports schedule_type=daily")
         if merged.get("timezone", SUPPORTED_TIMEZONE) != SUPPORTED_TIMEZONE:
             raise DomainError("MVP only supports timezone=%s" % SUPPORTED_TIMEZONE)
-        schedule_time = str(merged["schedule_time"])
-        match = re.fullmatch(r"(\d{2}):(\d{2})", schedule_time)
-        if not match or int(match.group(1)) > 23 or int(match.group(2)) > 59:
-            raise DomainError("schedule_time must be HH:MM")
+        try:
+            schedule_type, schedule_config = ScheduleValidator.validate_plan(merged)
+        except ScheduleError as exc:
+            raise self._schedule_domain_error(exc) from exc
         start = parse_date(merged["start_date"], "start_date")
         end_value = merged.get("end_date")
         end = parse_date(end_value, "end_date") if end_value else None
@@ -657,18 +1343,35 @@ class MedicationService:
                 merged.get("max_snooze_count", self.config["default_max_snooze_count"])
             )
         except (TypeError, ValueError) as exc:
-            raise DomainError("confirmation_window_minutes/max_snooze_count must be integers") from exc
+            raise DomainError(
+                "confirmation_window_minutes/max_snooze_count must be integers"
+            ) from exc
         if confirmation_window <= 0 or max_snooze_count < 0:
             raise DomainError("invalid confirmation or snooze configuration")
+
+        schedule_time = ""
+        if schedule_config.get("times"):
+            schedule_time = schedule_config["times"][0]
+        elif schedule_type == ScheduleType.INTERVAL:
+            anchor = schedule_config.get("anchor_at", "")
+            if re.fullmatch(r"\d{2}:\d{2}", str(anchor)):
+                schedule_time = anchor
+            elif anchor:
+                try:
+                    schedule_time = parse_datetime(anchor).astimezone(SHANGHAI).strftime("%H:%M")
+                except DomainError:
+                    schedule_time = ""
+
         return {
             "elder_id": str(merged["elder_id"]).strip(),
             "drug_name": str(merged.get("drug_name") or "").strip(),
             "dosage_text": str(merged.get("dosage_text") or "").strip(),
             "route": str(merged.get("route", "oral")).strip() or "oral",
-            "schedule_type": "daily",
+            "schedule_type": schedule_type,
             "schedule_time": schedule_time,
             "timezone": SUPPORTED_TIMEZONE,
             "relation_to_meal": merged.get("relation_to_meal"),
+            "schedule_config": schedule_config,
             "start_date": start.isoformat(),
             "end_date": end.isoformat() if end else None,
             "source": str(merged.get("source", "management_api")),
@@ -687,19 +1390,33 @@ class MedicationService:
                 """INSERT INTO medication_plan
                    (plan_id, version, elder_id, drug_name, dosage_text, route,
                     schedule_type, schedule_time, timezone, relation_to_meal,
-                    start_date, end_date, status, source, created_by,
-                    device_sn, confirmation_window_minutes, max_snooze_count,
-                    created_at, updated_at)
-                   VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?,
-                           ?, ?, ?, ?, ?)""",
+                    schedule_config_json, start_date, end_date, status, source,
+                    created_by, device_sn, confirmation_window_minutes,
+                    max_snooze_count, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    plan_id, plan["elder_id"], plan["drug_name"], plan["dosage_text"],
+                    plan_id, 1, plan["elder_id"], plan["drug_name"], plan["dosage_text"],
                     plan["route"], plan["schedule_type"], plan["schedule_time"],
-                    plan["timezone"], plan["relation_to_meal"], plan["start_date"],
-                    plan["end_date"], plan["source"], plan["created_by"],
+                    plan["timezone"], plan["relation_to_meal"],
+                    json_text(plan["schedule_config"]), plan["start_date"],
+                    plan["end_date"], "draft", plan["source"], plan["created_by"],
                     plan["device_sn"], plan["confirmation_window_minutes"],
                     plan["max_snooze_count"], current, current,
                 ),
+            )
+            validation_event = self._event(
+                "medication.schedule.validated", "medication_service",
+                elder_id=plan["elder_id"], plan_id=plan_id,
+                payload={
+                    "plan_id": plan_id,
+                    "plan_version": 1,
+                    "schedule_type": plan["schedule_type"],
+                    "schedule_config": plan["schedule_config"],
+                },
+            )
+            self._audit_and_enqueue(
+                connection, validation_event,
+                "schedule_validated:%s:1" % plan_id,
             )
             event = self._event(
                 "medication.plan.created", "medication_service",
@@ -756,6 +1473,10 @@ class MedicationService:
         blocked_result = None
         with self.storage.transaction() as connection:
             plan = self._select_plan(connection, plan_id, version)
+            # Schedule context is a domain prerequisite.  It is checked before
+            # the plan can enter M2, so missing breakfast/bedtime is never
+            # misreported as a clinical Safety BLOCK.
+            self._assert_schedule_ready_in_transaction(connection, plan)
             if plan["status"] == "active":
                 # Approval is idempotent after activation.  Re-check only when
                 # the active version has become stale under a new ruleset.
@@ -824,6 +1545,7 @@ class MedicationService:
                             "safety_check_id": safety["check_id"],
                             "safety_status": safety["status"],
                             "ruleset_version": safety["ruleset_version"],
+                            "ruleset_fingerprint": safety["ruleset_fingerprint"],
                         },
                         occurred_at=clock,
                     )
@@ -855,26 +1577,41 @@ class MedicationService:
     def revise_plan(self, plan_id, data):
         with self.storage.transaction() as connection:
             active = self._select_active_plan(connection, plan_id)
-            merged = dict(active)
-            merged.update(data or {})
-            plan = self._validate_plan_fields(merged, defaults=active)
+            plan = self._validate_plan_fields(data or {}, defaults=active)
             version = int(active["version"]) + 1
             timestamp = iso(now_utc())
             connection.execute(
                 """INSERT INTO medication_plan
                    (plan_id, version, elder_id, drug_name, dosage_text, route,
                     schedule_type, schedule_time, timezone, relation_to_meal,
-                    start_date, end_date, status, source, created_by, device_sn,
-                    confirmation_window_minutes, max_snooze_count, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?)""",
+                    schedule_config_json, start_date, end_date, status, source,
+                    created_by, device_sn, confirmation_window_minutes,
+                    max_snooze_count, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    plan_id, version, plan["elder_id"], plan["drug_name"], plan["dosage_text"],
-                    plan["route"], plan["schedule_type"], plan["schedule_time"],
-                    plan["timezone"], plan["relation_to_meal"], plan["start_date"],
-                    plan["end_date"], plan["source"], plan["created_by"], plan["device_sn"],
-                    plan["confirmation_window_minutes"], plan["max_snooze_count"],
-                    timestamp, timestamp,
+                    plan_id, version, plan["elder_id"], plan["drug_name"],
+                    plan["dosage_text"], plan["route"], plan["schedule_type"],
+                    plan["schedule_time"], plan["timezone"], plan["relation_to_meal"],
+                    json_text(plan["schedule_config"]), plan["start_date"],
+                    plan["end_date"], "draft", plan["source"], plan["created_by"],
+                    plan["device_sn"], plan["confirmation_window_minutes"],
+                    plan["max_snooze_count"], timestamp, timestamp,
                 ),
+            )
+            validation_event = self._event(
+                "medication.schedule.validated", "medication_service",
+                elder_id=plan["elder_id"], plan_id=plan_id,
+                payload={
+                    "plan_id": plan_id,
+                    "plan_version": version,
+                    "schedule_type": plan["schedule_type"],
+                    "schedule_config": plan["schedule_config"],
+                    "previous_version": active["version"],
+                },
+            )
+            self._audit_and_enqueue(
+                connection, validation_event,
+                "schedule_validated:%s:%s" % (plan_id, version),
             )
             event = self._event(
                 "medication.plan.version.created", "medication_service",
@@ -911,7 +1648,7 @@ class MedicationService:
                 (timestamp, plan_id, plan["version"]),
             )
             self._cancel_future_occurrences_in_transaction(
-                connection, plan_id, plan["version"] - 1, clock, "plan_paused"
+                connection, plan_id, plan["version"], clock, "plan_paused"
             )
             event = self._event(
                 "medication.plan.paused", "medication_service",
@@ -921,6 +1658,253 @@ class MedicationService:
             )
             self._audit_and_enqueue(connection, event)
         return self.get_plan(plan_id, plan["version"])
+
+    # ---------- explicit elder routine context ----------
+
+    def get_routine(self, elder_id):
+        if not str(elder_id or "").strip():
+            raise DomainError("elder_id is required")
+        row = self.storage.fetchone(
+            "SELECT * FROM elder_routine WHERE elder_id=?", (elder_id,)
+        )
+        return dict(row) if row else None
+
+    def get_elder_routine(self, elder_id):
+        return self.get_routine(elder_id)
+
+    @staticmethod
+    def _routine_anchor_changed(old_routine, new_routine, plan):
+        if old_routine is None:
+            return True
+        schedule_type = plan.get("schedule_type")
+        config = plan.get("schedule_config") or {}
+        if schedule_type == ScheduleType.MEAL_RELATION:
+            field = {
+                "BREAKFAST": "breakfast_time",
+                "LUNCH": "lunch_time",
+                "DINNER": "dinner_time",
+            }.get(str(config.get("meal") or "").upper())
+        elif schedule_type == ScheduleType.ROUTINE_RELATION:
+            field = "bedtime"
+        else:
+            return False
+        return bool(field and getattr(old_routine, field) != getattr(new_routine, field))
+
+    def _recalculate_active_plan_in_transaction(self, connection, plan, clock,
+                                                reason="schedule_recalculated"):
+        plan = self._normalize_plan_row(plan)
+        self._assert_schedule_ready_in_transaction(connection, plan)
+        safety = self._run_safety_check_in_transaction(connection, plan, clock)
+        cancelled = []
+        inserted = 0
+        if safety.get("status") != STATUS_BLOCK:
+            cancelled = self._cancel_future_occurrences_in_transaction(
+                connection, plan["plan_id"], plan["version"], clock, reason
+            )
+            inserted = self._ensure_occurrences_in_transaction(
+                connection, plan, clock, allow_reactivation=True
+            )
+        event = self._event(
+            "medication.schedule.recalculated", "medication_service",
+            elder_id=plan["elder_id"], plan_id=plan["plan_id"],
+            payload={
+                "plan_id": plan["plan_id"],
+                "plan_version": plan["version"],
+                "schedule_type": plan["schedule_type"],
+                "schedule_config": plan["schedule_config"],
+                "reason": reason,
+                "safety_status": safety.get("status"),
+                "cancelled_occurrence_ids": cancelled,
+                "occurrences_created": inserted,
+            },
+            occurred_at=clock,
+        )
+        self._audit_and_enqueue(
+            connection, event,
+            "schedule_recalculated:%s:%s:%s" % (
+                plan["plan_id"], plan["version"], reason
+            ),
+        )
+        return {
+            "plan_id": plan["plan_id"],
+            "plan_version": plan["version"],
+            "safety_status": safety.get("status"),
+            "cancelled_occurrence_ids": cancelled,
+            "occurrences_created": inserted,
+        }
+
+    def recalculate_plan_schedule(self, plan_id, version=None, now=None):
+        clock = now or now_utc()
+        if isinstance(clock, str):
+            clock = parse_datetime(clock)
+        with self.storage.transaction() as connection:
+            plan = self._select_active_plan(connection, plan_id, version)
+            result = self._recalculate_active_plan_in_transaction(
+                connection, plan, clock
+            )
+        result["plan"] = self.get_plan(plan_id, plan["version"])
+        return result
+
+    def recalculate_schedule(self, plan_id, version=None, now=None):
+        return self.recalculate_plan_schedule(plan_id, version, now)
+
+    def preview_schedule(self, plan_id, version=None, horizon_days=None, now=None):
+        clock = now or now_utc()
+        if isinstance(clock, str):
+            clock = parse_datetime(clock)
+        horizon = int(horizon_days or self.config["occurrence_window_days"])
+        if horizon <= 0 or horizon > 366:
+            raise DomainError("horizon_days must be between 1 and 366")
+        plan = self.get_plan(plan_id, version)
+        routine = self.get_routine(plan["elder_id"])
+        plan_start = datetime.combine(
+            parse_date(plan["start_date"], "start_date"), time.min, tzinfo=SHANGHAI
+        )
+        window_start = max(clock.astimezone(SHANGHAI), plan_start)
+        try:
+            specs = self.schedule_expander.expand(
+                plan=plan,
+                start=window_start,
+                end=window_start + timedelta(days=horizon),
+                routine=routine,
+            )
+        except ScheduleError as exc:
+            raise self._schedule_domain_error(exc) from exc
+        items = [
+            {
+                "scheduled_at": iso(spec.scheduled_at),
+                "scheduled_at_local": spec.scheduled_at.isoformat(),
+                "schedule_type": spec.schedule_type,
+                "schedule_snapshot": dict(spec.schedule_snapshot),
+                "schedule_source": spec.schedule_source,
+                "timezone": spec.timezone,
+            }
+            for spec in specs
+        ]
+        return {
+            "plan_id": plan_id,
+            "plan_version": plan["version"],
+            "horizon_days": horizon,
+            "schedule_type": plan["schedule_type"],
+            "schedule_config": plan["schedule_config"],
+            "items": items,
+            "occurrences": items,
+            "persisted": False,
+        }
+
+    def preview_plan_schedule(self, plan_id, version=None, horizon_days=None, now=None):
+        return self.preview_schedule(plan_id, version, horizon_days, now)
+
+    def update_routine(self, elder_id, data=None, now=None):
+        if not str(elder_id or "").strip():
+            raise DomainError("elder_id is required")
+        clock = now or now_utc()
+        if isinstance(clock, str):
+            clock = parse_datetime(clock)
+        data = dict(data or {})
+        routine_fields = (
+            "breakfast_time", "lunch_time", "dinner_time", "bedtime", "timezone",
+        )
+        with self.storage.transaction() as connection:
+            previous_row = connection.execute(
+                "SELECT * FROM elder_routine WHERE elder_id=?", (elder_id,)
+            ).fetchone()
+            previous = ElderRoutine.from_mapping(dict(previous_row)) if previous_row else None
+            merged = previous.to_dict() if previous else {"elder_id": elder_id}
+            # Version and timestamps are domain-owned.  A PUT can change only
+            # explicit routine values; it cannot forge a historical version.
+            for field_name in routine_fields:
+                if field_name in data:
+                    merged[field_name] = data[field_name]
+            merged["elder_id"] = elder_id
+            try:
+                candidate = ElderRoutine.from_mapping(merged)
+            except RoutineError as exc:
+                raise DomainError("SCHEDULE_INVALID", 422, {"message": str(exc)}) from exc
+
+            changed = previous is None or any(
+                getattr(previous, field_name) != getattr(candidate, field_name)
+                for field_name in routine_fields
+            )
+            if not changed:
+                # A semantically identical PUT must not advance version/time,
+                # emit an event, or start another schedule recalculation.
+                return {
+                    "routine": previous.to_dict(),
+                    "recalculated": [],
+                }
+
+            timestamp = iso(clock)
+            routine = ElderRoutine(
+                elder_id=elder_id,
+                breakfast_time=candidate.breakfast_time,
+                lunch_time=candidate.lunch_time,
+                dinner_time=candidate.dinner_time,
+                bedtime=candidate.bedtime,
+                timezone=candidate.timezone,
+                routine_version=(previous.routine_version + 1) if previous else 1,
+                updated_at=timestamp,
+            )
+
+            rows = connection.execute(
+                "SELECT * FROM medication_plan WHERE elder_id=? AND status='active'",
+                (elder_id,),
+            ).fetchall()
+            affected_plans = []
+            for row in rows:
+                plan = self._normalize_plan_row(row_dict(row))
+                if self._routine_anchor_changed(previous, routine, plan):
+                    affected_plans.append(plan)
+
+            connection.execute(
+                """INSERT INTO elder_routine
+                   (elder_id, breakfast_time, lunch_time, dinner_time, bedtime,
+                    timezone, routine_version, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(elder_id) DO UPDATE SET
+                       breakfast_time=excluded.breakfast_time,
+                       lunch_time=excluded.lunch_time,
+                       dinner_time=excluded.dinner_time,
+                       bedtime=excluded.bedtime,
+                       timezone=excluded.timezone,
+                       routine_version=excluded.routine_version,
+                       updated_at=excluded.updated_at""",
+                (
+                    elder_id, routine.breakfast_time, routine.lunch_time,
+                    routine.dinner_time, routine.bedtime, routine.timezone,
+                    routine.routine_version, timestamp,
+                ),
+            )
+            routine_payload = {
+                "elder_id": elder_id,
+                "routine": routine.to_dict(),
+                "previous_routine": previous.to_dict() if previous else None,
+                "old_routine_version": previous.routine_version if previous else None,
+                "new_routine_version": routine.routine_version,
+                "affected_plan_ids": [plan["plan_id"] for plan in affected_plans],
+            }
+            routine_event = self._event(
+                "medication.routine.updated", "medication_service",
+                elder_id=elder_id, payload=routine_payload, occurred_at=clock,
+            )
+            self._audit_and_enqueue(
+                connection, routine_event,
+                "routine_updated:%s:%s" % (elder_id, routine.routine_version),
+            )
+            recalculated = []
+            for plan in affected_plans:
+                recalculated.append(
+                    self._recalculate_active_plan_in_transaction(
+                        connection, plan, clock, reason="routine_changed"
+                    )
+                )
+        return {"routine": self.get_routine(elder_id), "recalculated": recalculated}
+
+    def upsert_routine(self, elder_id, data=None, now=None):
+        return self.update_routine(elder_id, data, now)
+
+    def update_elder_routine(self, elder_id, data=None, now=None):
+        return self.update_routine(elder_id, data, now)
 
     def list_plans(self, elder_id=None):
         if elder_id:
@@ -965,7 +1949,7 @@ class MedicationService:
             ).fetchone()
         if row is None:
             raise DomainError("plan not found", 404)
-        return row_dict(row)
+        return self._normalize_plan_row(row_dict(row))
 
     def _select_active_plan(self, connection, plan_id, version=None):
         if version is None:
@@ -980,45 +1964,103 @@ class MedicationService:
             ).fetchone()
         if row is None:
             raise DomainError("active plan not found", 409)
-        return row_dict(row)
+        return self._normalize_plan_row(row_dict(row))
 
     # ---------- occurrence generation and scheduler ----------
 
     def _local_schedule(self, plan, day):
+        # Compatibility helper retained for callers that used the old MVP
+        # private method.  New expansion goes through ScheduleExpander.
         hour, minute = [int(part) for part in plan["schedule_time"].split(":")]
         return datetime.combine(day, time(hour, minute), tzinfo=SHANGHAI)
 
-    def _ensure_occurrences_in_transaction(self, connection, plan, clock):
-        local_day = clock.astimezone(SHANGHAI).date()
-        start = max(local_day, parse_date(plan["start_date"], "start_date"))
-        end = start + timedelta(days=int(self.config["occurrence_window_days"]) - 1)
-        if plan.get("end_date"):
-            end = min(end, parse_date(plan["end_date"], "end_date"))
-        if end < start:
-            return 0
+    def _ensure_occurrences_in_transaction(self, connection, plan, clock,
+                                          allow_reactivation=False):
+        plan = self._normalize_plan_row(plan)
+        specs = self._expand_plan_specs_in_transaction(connection, plan, clock)
         inserted = 0
-        current_day = start
-        while current_day <= end:
-            scheduled = self._local_schedule(plan, current_day).astimezone(UTC)
-            deadline = scheduled + timedelta(minutes=int(plan["confirmation_window_minutes"]))
+        reactivated = 0
+        inserted_times = []
+        for spec in specs:
+            scheduled = spec.scheduled_at.astimezone(UTC)
+            deadline = scheduled + timedelta(
+                minutes=int(plan["confirmation_window_minutes"])
+            )
             scheduled_text = iso(scheduled)
-            occurrence_id = new_id("occ")
+            occurrence_id = self._occurrence_identity(plan, scheduled)
+            existing = connection.execute(
+                "SELECT intake_status, cancel_reason FROM medication_occurrence "
+                "WHERE occurrence_id=?",
+                (occurrence_id,),
+            ).fetchone()
+            if (
+                allow_reactivation
+                and existing is not None
+                and existing["intake_status"] == "cancelled"
+                and existing["cancel_reason"] in ("routine_changed", "schedule_recalculated")
+            ):
+                cursor = connection.execute(
+                    """UPDATE medication_occurrence
+                       SET confirmation_deadline_at=?, next_reminder_at=?,
+                           intake_status='unconfirmed', actual_time=NULL,
+                           confirmation_method=NULL, reminder_count=0,
+                           snooze_count=0, max_snooze_count=?, max_snooze_until=?,
+                           reminder_claimed_at=NULL, cancel_reason=NULL,
+                           cancelled_by_safety_check_id=NULL, updated_at=?
+                       WHERE occurrence_id=? AND intake_status='cancelled'""",
+                    (
+                        iso(deadline), scheduled_text,
+                        int(plan["max_snooze_count"]), iso(deadline), iso(clock),
+                        occurrence_id,
+                    ),
+                )
+                if cursor.rowcount:
+                    inserted += cursor.rowcount
+                    reactivated += cursor.rowcount
+                    inserted_times.append(scheduled_text)
+                continue
             cursor = connection.execute(
                 """INSERT OR IGNORE INTO medication_occurrence
                    (occurrence_id, plan_id, plan_version, elder_id, scheduled_at,
                     confirmation_deadline_at, next_reminder_at, intake_status,
                     max_snooze_count, max_snooze_until, drug_name_snapshot,
-                    dosage_snapshot, relation_to_meal_snapshot, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, 'unconfirmed', ?, ?, ?, ?, ?, ?, ?)""",
+                    dosage_snapshot, relation_to_meal_snapshot, schedule_type,
+                    schedule_snapshot_json, schedule_source, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'unconfirmed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     occurrence_id, plan["plan_id"], plan["version"], plan["elder_id"],
                     scheduled_text, iso(deadline), scheduled_text,
                     int(plan["max_snooze_count"]), iso(deadline), plan["drug_name"],
-                    plan["dosage_text"], plan.get("relation_to_meal"), iso(clock), iso(clock),
+                    plan["dosage_text"], plan.get("relation_to_meal"),
+                    spec.schedule_type, json_text(spec.schedule_snapshot),
+                    spec.schedule_source, iso(clock), iso(clock),
                 ),
             )
-            inserted += cursor.rowcount
-            current_day += timedelta(days=1)
+            if cursor.rowcount:
+                inserted += cursor.rowcount
+                inserted_times.append(scheduled_text)
+        if inserted:
+            payload = {
+                "plan_id": plan["plan_id"],
+                "plan_version": plan["version"],
+                "schedule_type": plan["schedule_type"],
+                "schedule_config": plan["schedule_config"],
+                "occurrence_count": inserted,
+                "occurrences_reactivated": reactivated,
+                "scheduled_at": inserted_times,
+                "horizon_days": int(self.config["occurrence_window_days"]),
+            }
+            event = self._event(
+                "medication.schedule.expanded", "medication_service",
+                elder_id=plan["elder_id"], plan_id=plan["plan_id"],
+                payload=payload, occurred_at=clock,
+            )
+            self._audit_and_enqueue(
+                connection, event,
+                "schedule_expanded:%s:%s:%s" % (
+                    plan["plan_id"], plan["version"], inserted_times[-1]
+                ),
+            )
         return inserted
 
     def ensure_occurrences(self, now=None):
@@ -1029,7 +2071,14 @@ class MedicationService:
             ).fetchall()
             inserted = 0
             for row in plans:
-                plan = dict(row)
+                plan = self._normalize_plan_row(row_dict(row))
+                try:
+                    self._assert_schedule_ready_in_transaction(connection, plan)
+                except DomainError:
+                    # An active plan can outlive its routine context.  Keep
+                    # history intact and wait for an explicit context update;
+                    # never guess an anchor or generate a reminder.
+                    continue
                 safety = self._ensure_plan_safety_in_transaction(connection, plan, clock)
                 if safety.get("status") == STATUS_BLOCK:
                     # A stale ruleset or a provider failure never opens a new
@@ -1631,7 +2680,10 @@ class MedicationService:
             ).fetchone()
             if occurrence is None:
                 raise DomainError("occurrence not found", 404)
-            if interaction["status"] != "open" or parse_datetime(interaction["expires_at"]) <= clock:
+            late_voice = (
+                action == "CONFIRM_TAKEN" and occurrence["intake_status"] == "closed_unconfirmed"
+            )
+            if (interaction["status"] != "open" or parse_datetime(interaction["expires_at"]) <= clock) and not late_voice:
                 raise DomainError("interaction is expired or already closed", 409)
             incoming = self._event(
                 "medication.user_response", data.get("source", "chat_agent"),
@@ -1653,7 +2705,7 @@ class MedicationService:
                     "reminder_text": self._reminder_text(occurrence),
                     "occurrence": row_dict(occurrence),
                 }
-            if occurrence["intake_status"] != UNCONFIRMED:
+            if occurrence["intake_status"] != UNCONFIRMED and not late_voice:
                 raise DomainError("occurrence is already in terminal state", 409)
             timestamp = iso(clock)
             if action == "DELAY":
@@ -1691,36 +2743,77 @@ class MedicationService:
                     }, occurred_at=clock, trace_id=trace_id,
                 )
             else:
-                new_status = "confirmed_taken" if action == "CONFIRM_TAKEN" else "skipped"
-                method = data.get("confirmation_method", "voice")
-                connection.execute(
-                    """UPDATE medication_occurrence
-                       SET intake_status=?, actual_time=?, confirmation_method=?,
-                           reminder_claimed_at=NULL, updated_at=?
-                       WHERE occurrence_id=? AND intake_status='unconfirmed'""",
-                    (new_status, iso(occurred_at), method, timestamp, occurrence["occurrence_id"]),
+                source = str(data.get("source") or "chat_agent").strip().lower()
+                source_type = data.get("source_type") or (
+                    "USER_BUTTON"
+                    if source.endswith("_ui") or source in ("web", "web_test", "button")
+                    else "USER_VOICE"
                 )
-                connection.execute(
-                    "UPDATE medication_interaction SET status='closed', updated_at=? WHERE interaction_id=?",
-                    (timestamp, interaction_id),
+                evidence_result = self._record_evidence_in_transaction(
+                    connection,
+                    dict(
+                        data,
+                        event_id="%s:evidence" % event_id,
+                        elder_id=occurrence["elder_id"],
+                        occurrence_id=occurrence["occurrence_id"],
+                        interaction_id=interaction_id,
+                        source_type=source_type,
+                        evidence_type=(
+                            "SELF_REPORTED_NOT_TAKEN"
+                            if action == "SKIP"
+                            else "BUTTON_CONFIRMED"
+                            if self._normalize_evidence_source(source_type) == "USER_BUTTON"
+                            else "SELF_REPORTED_TAKEN"
+                        ),
+                        observed_at=iso(occurred_at),
+                        value={"text": data.get("text"), "action": action},
+                        trace_id=trace_id,
+                    ),
+                    assess=action == "CONFIRM_TAKEN",
+                    identity_trusted=self._normalize_evidence_source(source_type) in (
+                        "USER_VOICE", "USER_BUTTON"
+                    ),
                 )
-                output = self._event(
-                    "medication.intake.updated", "medication_service",
-                    elder_id=occurrence["elder_id"], plan_id=occurrence["plan_id"],
-                    occurrence_id=occurrence["occurrence_id"], payload={
-                        "interaction_id": interaction_id,
-                        "trace_id": trace_id,
-                        "status": new_status,
-                        "actual_time": iso(occurred_at),
-                        "confirmation_method": method,
-                    }, occurred_at=clock, trace_id=trace_id,
-                )
-            self._audit_and_enqueue(connection, output)
+                if action == "SKIP":
+                    connection.execute(
+                        """UPDATE medication_occurrence
+                           SET intake_status='skipped', actual_time=?,
+                               confirmation_method='voice', reminder_claimed_at=NULL, updated_at=?
+                           WHERE occurrence_id=? AND intake_status='unconfirmed'""",
+                        (iso(occurred_at), timestamp, occurrence["occurrence_id"]),
+                    )
+                    connection.execute(
+                        "UPDATE medication_interaction SET status='closed', updated_at=? WHERE interaction_id=?",
+                        (timestamp, interaction_id),
+                    )
+                    output = self._event(
+                        "medication.intake.updated", "medication_service",
+                        elder_id=occurrence["elder_id"], plan_id=occurrence["plan_id"],
+                        occurrence_id=occurrence["occurrence_id"], payload={
+                            "interaction_id": interaction_id, "trace_id": trace_id,
+                            "status": "skipped", "actual_time": iso(occurred_at),
+                            "confirmation_method": "voice",
+                        }, occurred_at=clock, trace_id=trace_id,
+                    )
+                    self._audit_and_enqueue(connection, output)
             updated = connection.execute(
                 "SELECT * FROM medication_occurrence WHERE occurrence_id=?",
                 (occurrence["occurrence_id"],),
             ).fetchone()
-            return {"duplicate": False, "action": action, "trace_id": trace_id, "occurrence": row_dict(updated)}
+            if action == "DELAY":
+                self._audit_and_enqueue(connection, output)
+            response = {
+                "duplicate": False,
+                "action": action,
+                "trace_id": trace_id,
+                "occurrence": row_dict(updated),
+            }
+            if action == "CONFIRM_TAKEN":
+                response["assessment"] = self._hydrate_assessment(evidence_result["assessment"])
+                response["evidence"] = self._hydrate_evidence(evidence_result["evidence"])
+            elif action == "SKIP":
+                response["evidence"] = self._hydrate_evidence(evidence_result["evidence"])
+            return response
 
     def _occurrence_for_interaction(self, connection, interaction_id):
         interaction = connection.execute(
@@ -2503,145 +3596,63 @@ class MedicationService:
             "escalation": self.get_escalation(escalation_id),
         }
 
+    # ---------- queries ----------
     def record_manual_confirmation(self, occurrence_id, data=None):
-        """Record an on-time manual confirmation or a late verification.
-
-        A late verification is an additional fact.  It never rewrites the
-        original ``closed_unconfirmed`` intake status.
-        """
+        """Record an operator report through M5, including late verification."""
 
         data = dict(data or {})
         actor_id, actor_role = self._actor_fields(data)
         event_id = str(data.get("event_id") or new_id("evt"))
         occurred_at = parse_datetime(data["occurred_at"]) if data.get("occurred_at") else now_utc()
-        clock = now_utc()
-        duplicate = False
+        value = {
+            "confirmation_method": str(
+                data.get("confirmation_method") or "manual"
+            ).strip() or "manual",
+            "late_verified_source": str(
+                data.get("late_verified_source") or data.get("source") or actor_role
+            ).strip(),
+            "late_verified_note": str(
+                data.get("late_verified_note") or data.get("note") or ""
+            ).strip() or None,
+        }
+        if isinstance(data.get("value"), dict):
+            value.update(data["value"])
         with self.storage.transaction() as connection:
-            existing_event = connection.execute(
-                "SELECT event_type FROM medication_event_log WHERE event_id=?",
+            current = connection.execute(
+                "SELECT intake_status FROM medication_occurrence WHERE occurrence_id=?",
+                (occurrence_id,),
+            ).fetchone()
+            if current is None:
+                raise DomainError("occurrence not found", 404)
+            existing_evidence = connection.execute(
+                "SELECT evidence_id FROM medication_evidence WHERE event_id=?",
                 (event_id,),
             ).fetchone()
-            if existing_event is not None:
-                if existing_event["event_type"] not in (
-                    "medication.intake.updated", "medication.intake.late_verified",
-                ):
-                    raise DomainError("event_id is already used by another event", 409)
-                duplicate = True
-            else:
-                occurrence = connection.execute(
-                    "SELECT * FROM medication_occurrence WHERE occurrence_id=?",
-                    (occurrence_id,),
-                ).fetchone()
-                if occurrence is None:
-                    raise DomainError("occurrence not found", 404)
-                status = occurrence["intake_status"]
-                timestamp = iso(clock)
-                if status == UNCONFIRMED:
-                    if parse_datetime(occurrence["confirmation_deadline_at"]) <= clock:
-                        raise DomainError(
-                            "confirmation window is closed; run scheduler before late verification",
-                            409,
-                        )
-                    confirmation_method = str(
-                        data.get("confirmation_method") or "manual"
-                    ).strip() or "manual"
-                    cursor = connection.execute(
-                        """UPDATE medication_occurrence
-                           SET intake_status='confirmed_taken', actual_time=?,
-                               confirmation_method=?, reminder_claimed_at=NULL,
-                               updated_at=?
-                           WHERE occurrence_id=? AND intake_status='unconfirmed'""",
-                        (iso(occurred_at), confirmation_method, timestamp, occurrence_id),
-                    )
-                    if cursor.rowcount != 1:
-                        raise DomainError("occurrence state changed concurrently", 409)
-                    connection.execute(
-                        """UPDATE medication_interaction SET status='closed', updated_at=?
-                           WHERE occurrence_id=? AND status='open'""",
-                        (timestamp, occurrence_id),
-                    )
-                    payload = {
-                        "occurrence_id": occurrence_id,
-                        "interaction_id": None,
-                        "trace_id": "occurrence:%s" % occurrence_id,
-                        "status": "confirmed_taken",
-                        "actual_time": iso(occurred_at),
-                        "confirmation_method": confirmation_method,
-                        "actor_id": actor_id,
-                        "actor_role": actor_role,
-                    }
-                    event = self._event(
-                        "medication.intake.updated",
-                        "manual_actor",
-                        elder_id=occurrence["elder_id"],
-                        plan_id=occurrence["plan_id"],
-                        occurrence_id=occurrence_id,
-                        payload=payload,
-                        occurred_at=occurred_at,
-                        event_id=event_id,
-                        trace_id=payload["trace_id"],
-                    )
-                    self._audit_and_enqueue(
-                        connection, event,
-                        "manual_confirmation:%s:%s" % (occurrence_id, event_id),
-                    )
-                elif status == "closed_unconfirmed":
-                    late_verified_source = str(
-                        data.get("late_verified_source")
-                        or data.get("source")
-                        or actor_role
-                    ).strip()
-                    late_verified_note = str(
-                        data.get("late_verified_note")
-                        or data.get("note")
-                        or ""
-                    ).strip() or None
-                    late_verified_taken_at = iso(occurred_at)
-                    cursor = connection.execute(
-                        """UPDATE medication_occurrence
-                           SET late_verified_taken_at=?, late_verified_by=?,
-                               late_verified_source=?, late_verified_note=?,
-                               updated_at=?
-                           WHERE occurrence_id=? AND intake_status='closed_unconfirmed'""",
-                        (
-                            late_verified_taken_at, actor_id, late_verified_source,
-                            late_verified_note, timestamp, occurrence_id,
-                        ),
-                    )
-                    if cursor.rowcount != 1:
-                        raise DomainError("occurrence state changed concurrently", 409)
-                    payload = {
-                        "occurrence_id": occurrence_id,
-                        "interaction_id": None,
-                        "trace_id": "occurrence:%s" % occurrence_id,
-                        "status": "closed_unconfirmed",
-                        "late_verified_taken": True,
-                        "late_verified_taken_at": late_verified_taken_at,
-                        "late_verified_by": actor_id,
-                        "late_verified_source": late_verified_source,
-                        "late_verified_note": late_verified_note,
-                        "actor_id": actor_id,
-                        "actor_role": actor_role,
-                    }
-                    event = self._event(
-                        "medication.intake.late_verified",
-                        "manual_actor",
-                        elder_id=occurrence["elder_id"],
-                        plan_id=occurrence["plan_id"],
-                        occurrence_id=occurrence_id,
-                        payload=payload,
-                        occurred_at=occurred_at,
-                        event_id=event_id,
-                        trace_id=payload["trace_id"],
-                    )
-                    self._audit_and_enqueue(
-                        connection, event,
-                        "late_confirmation:%s:%s" % (occurrence_id, event_id),
-                    )
-                else:
-                    raise DomainError("occurrence is not confirmable", 409)
+            if existing_evidence is None and current["intake_status"] not in (UNCONFIRMED, "closed_unconfirmed"):
+                raise DomainError("occurrence is already in terminal state", 409)
+            result = self._record_evidence_in_transaction(
+                connection,
+                dict(
+                    data,
+                    event_id=event_id,
+                    occurrence_id=occurrence_id,
+                    source_type="MANUAL_OPERATOR",
+                    evidence_type="MANUAL_REPORTED_TAKEN",
+                    observed_at=iso(occurred_at),
+                    value=value,
+                    actor_id=actor_id,
+                    actor_role=actor_role,
+                    trace_id=str(data.get("trace_id") or "occurrence:%s" % occurrence_id),
+                ),
+                assess=True,
+                identity_trusted=False,
+                source_trusted=False,
+            )
         return {
-            "duplicate": duplicate,
+            "duplicate": result["duplicate"],
+            "evidence": self._hydrate_evidence(result["evidence"]),
+            "assessment": self._hydrate_assessment(result["assessment"]),
+            "late": bool(result["late"]),
             "occurrence": self.get_occurrence(occurrence_id),
         }
 
@@ -2676,6 +3687,20 @@ class MedicationService:
                 (elder_id, iso(clock)),
             )
         return row_dict(row)
+    def get_interaction(self, elder_id, interaction_id):
+        """Return an exact interaction binding, including closed late ones."""
+
+        if not elder_id or not interaction_id:
+            return None
+        row = self.storage.fetchone(
+            """SELECT i.*, o.intake_status, o.confirmation_deadline_at
+               FROM medication_interaction i
+               JOIN medication_occurrence o ON o.occurrence_id=i.occurrence_id
+               WHERE i.elder_id=? AND i.interaction_id=?""",
+            (elder_id, interaction_id),
+        )
+        return row_dict(row)
+
 
     def _related_occurrence_rows(self, table, occurrence_ids):
         """Fetch occurrence children in bounded batches to avoid N+1 queries."""
@@ -2695,11 +3720,52 @@ class MedicationService:
                 grouped[row["occurrence_id"]].append(row_dict(row))
         return grouped
 
+    def _confirmation_summaries(self, occurrence_ids):
+        if not occurrence_ids:
+            return {}
+        summaries = {
+            occurrence_id: {
+                "confirmation_basis": None,
+                "confirmation_result": None,
+                "evidence_count": 0,
+                "evidence_conflict": False,
+                "review_required": False,
+            }
+            for occurrence_id in occurrence_ids
+        }
+        for offset in range(0, len(occurrence_ids), 500):
+            batch = occurrence_ids[offset:offset + 500]
+            placeholders = ",".join("?" for _ in batch)
+            evidence_rows = self.storage.fetchall(
+                "SELECT occurrence_id, COUNT(*) AS evidence_count "
+                "FROM medication_evidence WHERE occurrence_id IN (%s) "
+                "GROUP BY occurrence_id" % placeholders,
+                batch,
+            )
+            for row in evidence_rows:
+                summaries[row["occurrence_id"]]["evidence_count"] = int(row["evidence_count"])
+            assessment_rows = self.storage.fetchall(
+                "SELECT * FROM medication_confirmation_assessment "
+                "WHERE occurrence_id IN (%s) ORDER BY assessed_at, created_at, assessment_id"
+                % placeholders,
+                batch,
+            )
+            for row in assessment_rows:
+                latest = self._hydrate_assessment(row)
+                summaries[row["occurrence_id"]].update({
+                    "confirmation_basis": latest.get("basis"),
+                    "confirmation_result": latest.get("result"),
+                    "evidence_conflict": bool(latest.get("conflict_detected")),
+                    "review_required": bool(latest.get("review_required")),
+                })
+        return summaries
+
     def _occurrences_with_details(self, rows):
         rows = list(rows)
         occurrence_ids = [row["occurrence_id"] for row in rows]
         attempts = self._related_occurrence_rows("reminder_attempt", occurrence_ids)
         interactions = self._related_occurrence_rows("medication_interaction", occurrence_ids)
+        confirmations = self._confirmation_summaries(occurrence_ids)
         result = []
         for row in rows:
             item = row_dict(row)
@@ -2707,6 +3773,15 @@ class MedicationService:
             item["reminder_attempts"] = attempts.get(occurrence_id, [])
             item["interactions"] = interactions.get(occurrence_id, [])
             item["late_verified_taken"] = bool(item.get("late_verified_taken_at"))
+            snapshot = item.get("schedule_snapshot_json")
+            item.update(confirmations.get(occurrence_id, {}))
+            if snapshot:
+                try:
+                    item["schedule_snapshot"] = json.loads(snapshot)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    item["schedule_snapshot"] = {}
+            else:
+                item["schedule_snapshot"] = {}
             result.append(item)
         return result
 

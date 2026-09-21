@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS medication_plan (
     schedule_time TEXT NOT NULL,
     timezone TEXT NOT NULL,
     relation_to_meal TEXT,
+    schedule_config_json TEXT,
     start_date TEXT NOT NULL,
     end_date TEXT,
     status TEXT NOT NULL,
@@ -99,6 +100,9 @@ CREATE TABLE IF NOT EXISTS medication_occurrence (
     drug_name_snapshot TEXT NOT NULL,
     dosage_snapshot TEXT NOT NULL,
     relation_to_meal_snapshot TEXT,
+    schedule_type TEXT,
+    schedule_snapshot_json TEXT,
+    schedule_source TEXT,
     cancel_reason TEXT,
     cancelled_by_safety_check_id TEXT,
     late_verified_taken_at TEXT,
@@ -114,6 +118,17 @@ CREATE INDEX IF NOT EXISTS idx_occurrence_due
     ON medication_occurrence (intake_status, next_reminder_at);
 CREATE INDEX IF NOT EXISTS idx_occurrence_elder_time
     ON medication_occurrence (elder_id, scheduled_at);
+
+CREATE TABLE IF NOT EXISTS elder_routine (
+    elder_id TEXT PRIMARY KEY,
+    breakfast_time TEXT,
+    lunch_time TEXT,
+    dinner_time TEXT,
+    bedtime TEXT,
+    timezone TEXT NOT NULL,
+    routine_version INTEGER NOT NULL DEFAULT 1,
+    updated_at TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS medication_escalation (
     escalation_id TEXT PRIMARY KEY,
@@ -197,6 +212,77 @@ CREATE INDEX IF NOT EXISTS idx_interaction_occurrence
 CREATE INDEX IF NOT EXISTS idx_interaction_elder_status_expiry
     ON medication_interaction (elder_id, status, expires_at);
 
+CREATE TABLE IF NOT EXISTS medication_evidence (
+    evidence_id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL UNIQUE,
+    elder_id TEXT NOT NULL,
+    occurrence_id TEXT NOT NULL,
+    interaction_id TEXT,
+    source_type TEXT NOT NULL,
+    evidence_type TEXT NOT NULL,
+    value_json TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    actor_id TEXT,
+    actor_role TEXT,
+    device_id TEXT,
+    identity_trusted INTEGER NOT NULL DEFAULT 0,
+    source_trusted INTEGER NOT NULL DEFAULT 0,
+    trace_id TEXT NOT NULL,
+    out_of_window INTEGER NOT NULL DEFAULT 0,
+    invalid INTEGER NOT NULL DEFAULT 0,
+    invalid_reason TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_medication_evidence_occurrence
+    ON medication_evidence (occurrence_id, observed_at, created_at);
+CREATE INDEX IF NOT EXISTS idx_medication_evidence_elder
+    ON medication_evidence (elder_id, created_at);
+
+CREATE TABLE IF NOT EXISTS medication_confirmation_assessment (
+    assessment_id TEXT PRIMARY KEY,
+    occurrence_id TEXT NOT NULL,
+    result TEXT NOT NULL,
+    basis TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    policy_fingerprint TEXT,
+    evidence_ids_json TEXT NOT NULL,
+    conflict_detected INTEGER NOT NULL DEFAULT 0,
+    review_required INTEGER NOT NULL DEFAULT 0,
+    late INTEGER NOT NULL DEFAULT 0,
+    assessed_at TEXT NOT NULL,
+    trace_id TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_confirmation_assessment_occurrence
+    ON medication_confirmation_assessment (occurrence_id, assessed_at, created_at);
+
+CREATE TRIGGER IF NOT EXISTS trg_medication_evidence_immutable_update
+BEFORE UPDATE ON medication_evidence
+BEGIN
+    SELECT RAISE(ABORT, 'medication evidence is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_medication_evidence_immutable_delete
+BEFORE DELETE ON medication_evidence
+BEGIN
+    SELECT RAISE(ABORT, 'medication evidence is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_confirmation_assessment_immutable_update
+BEFORE UPDATE ON medication_confirmation_assessment
+BEGIN
+    SELECT RAISE(ABORT, 'confirmation assessment is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_confirmation_assessment_immutable_delete
+BEFORE DELETE ON medication_confirmation_assessment
+BEGIN
+    SELECT RAISE(ABORT, 'confirmation assessment is immutable');
+END;
+
 CREATE TABLE IF NOT EXISTS medication_event_log (
     log_id INTEGER PRIMARY KEY AUTOINCREMENT,
     event_id TEXT NOT NULL UNIQUE,
@@ -275,11 +361,17 @@ class Storage:
                 self._ensure_schema_evolution(self._memory_connection)
 
     def _ensure_schema_evolution(self, connection):
-        """Add nullable Phase 2.1 columns without rebuilding user databases."""
+        """Add nullable evolution columns/triggers without rebuilding user databases."""
 
         migrations = {
             "medication_safety_check": {
                 "ruleset_fingerprint": "TEXT",
+            },
+            "medication_plan": {
+                "schedule_config_json": "TEXT",
+            },
+            "elder_routine": {
+                "routine_version": "INTEGER NOT NULL DEFAULT 1",
             },
             "medication_occurrence": {
                 "cancel_reason": "TEXT",
@@ -288,6 +380,9 @@ class Storage:
                 "late_verified_by": "TEXT",
                 "late_verified_source": "TEXT",
                 "late_verified_note": "TEXT",
+                "schedule_type": "TEXT",
+                "schedule_snapshot_json": "TEXT",
+                "schedule_source": "TEXT",
             },
             "medication_escalation": {
                 "resolution_deadline_at": "TEXT",
@@ -309,6 +404,8 @@ class Storage:
         )
         connection.executescript(
             """
+            DROP TRIGGER IF EXISTS trg_active_plan_sensitive_update_frozen;
+
             CREATE TRIGGER IF NOT EXISTS trg_plan_insert_active_requires_safety
             BEFORE INSERT ON medication_plan
             WHEN NEW.status='active' AND NOT EXISTS (
@@ -333,9 +430,27 @@ class Storage:
                 SELECT RAISE(ABORT, 'active plan requires a current safety check');
             END;
 
+            CREATE TRIGGER IF NOT EXISTS trg_plan_identity_version_immutable
+            BEFORE UPDATE OF plan_id, version ON medication_plan
+            WHEN NEW.plan_id IS NOT OLD.plan_id OR NEW.version IS NOT OLD.version
+            BEGIN
+                SELECT RAISE(ABORT, 'plan identity and version are immutable');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_plan_status_lifecycle_frozen
+            BEFORE UPDATE OF status ON medication_plan
+            WHEN (OLD.status='draft' AND NEW.status NOT IN ('draft', 'pending_confirmation'))
+              OR (OLD.status='pending_confirmation' AND NEW.status NOT IN ('pending_confirmation', 'active'))
+              OR (OLD.status='active' AND NEW.status NOT IN ('active', 'completed', 'paused'))
+              OR (OLD.status IN ('paused', 'completed') AND NEW.status IS NOT OLD.status)
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid plan lifecycle transition');
+            END;
+
             CREATE TRIGGER IF NOT EXISTS trg_active_plan_sensitive_update_frozen
             BEFORE UPDATE OF elder_id, drug_name, dosage_text, route, schedule_type,
-                schedule_time, timezone, relation_to_meal, start_date, end_date,
+                schedule_time, timezone, relation_to_meal, schedule_config_json,
+                start_date, end_date,
                 device_sn, confirmation_window_minutes, max_snooze_count
                 ON medication_plan
             WHEN OLD.status='active' AND (
@@ -347,6 +462,7 @@ class Storage:
                 NEW.schedule_time IS NOT OLD.schedule_time OR
                 NEW.timezone IS NOT OLD.timezone OR
                 NEW.relation_to_meal IS NOT OLD.relation_to_meal OR
+                NEW.schedule_config_json IS NOT OLD.schedule_config_json OR
                 NEW.start_date IS NOT OLD.start_date OR
                 NEW.end_date IS NOT OLD.end_date OR
                 NEW.device_sn IS NOT OLD.device_sn OR

@@ -80,9 +80,27 @@ class Application:
                 return 200, {"status": "ready"}
             if method == "POST" and path == "/api/v1/medication/plans/draft":
                 return 201, self.service.create_draft(body)
+            routine_prefix = "/api/v1/medication/elders/"
+            if method == "GET" and path.startswith(routine_prefix) and path.endswith("/routine"):
+                elder_id = path[len(routine_prefix):-len("/routine")]
+                routine = self.service.get_routine(elder_id)
+                if routine is None:
+                    raise DomainError("routine not found", 404)
+                return 200, routine
+            if method == "PUT" and path.startswith(routine_prefix) and path.endswith("/routine"):
+                elder_id = path[len(routine_prefix):-len("/routine")]
+                return 200, self.service.update_routine(elder_id, body)
             if method == "GET" and path == "/api/v1/medication/plans":
                 return 200, {"items": self.service.list_plans(query.get("elder_id"))}
             plan_safety_prefix = "/api/v1/medication/plans/"
+            if method == "GET" and path.startswith(plan_safety_prefix) and path.endswith("/schedule/preview"):
+                plan_id = path[len(plan_safety_prefix):-len("/schedule/preview")]
+                horizon = query.get("horizon_days")
+                version = query.get("version")
+                return 200, self.service.preview_schedule(
+                    plan_id, version, int(horizon) if horizon else None,
+                    query.get("now"),
+                )
             if method == "GET" and path.startswith(plan_safety_prefix) and path.endswith("/safety/history"):
                 plan_id = path[len(plan_safety_prefix):-len("/safety/history")]
                 return 200, {"items": self.service.list_safety_history(plan_id)}
@@ -131,6 +149,11 @@ class Application:
             if method == "POST" and path.endswith("/revise") and "/plans/" in path:
                 plan_id = path.split("/plans/", 1)[1].rsplit("/revise", 1)[0]
                 return 201, self.service.revise_plan(plan_id, body)
+            if method == "POST" and path.endswith("/schedule/recalculate") and "/plans/" in path:
+                plan_id = path.split("/plans/", 1)[1].rsplit("/schedule/recalculate", 1)[0]
+                return 200, self.service.recalculate_plan_schedule(
+                    plan_id, body.get("version"), body.get("now")
+                )
             if method == "GET" and path.startswith("/api/v1/medication/plans/"):
                 plan_id = path.rsplit("/", 1)[1]
                 return 200, {"items": self.service.list_plans_by_id(plan_id)}
@@ -169,6 +192,22 @@ class Application:
                 escalation_id = path[len(escalation_prefix):]
                 if escalation_id:
                     return 200, self.service.get_escalation(escalation_id)
+            if method == "POST" and path == "/api/v1/medication/evidence":
+                return 201, self.service.record_evidence(body)
+            if method == "POST" and path.startswith("/api/v1/medication/occurrences/") and path.endswith("/evidence"):
+                occurrence_id = path[len("/api/v1/medication/occurrences/"):-len("/evidence")]
+                payload = dict(body)
+                if payload.get("occurrence_id") and payload["occurrence_id"] != occurrence_id:
+                    raise DomainError("occurrence_id does not match evidence path", 409)
+                payload["occurrence_id"] = occurrence_id
+                return 201, self.service.record_evidence(payload)
+            if method == "GET" and path.startswith("/api/v1/medication/occurrences/") and path.endswith("/evidence"):
+                occurrence_id = path[len("/api/v1/medication/occurrences/"):-len("/evidence")]
+                return 200, {"occurrence_id": occurrence_id,
+                             "items": self.service.list_evidence(occurrence_id)}
+            if method == "GET" and path.startswith("/api/v1/medication/occurrences/") and path.endswith("/confirmation"):
+                occurrence_id = path[len("/api/v1/medication/occurrences/"):-len("/confirmation")]
+                return 200, self.service.get_confirmation(occurrence_id)
             if method == "POST" and path.startswith("/api/v1/medication/occurrences/") and path.endswith("/confirm"):
                 occurrence_id = path[len("/api/v1/medication/occurrences/"):-len("/confirm")]
                 return 200, self.service.record_manual_confirmation(occurrence_id, body)
@@ -227,7 +266,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._write_bytes(*static)
                 return
         body = {}
-        if method == "POST":
+        if method in ("POST", "PUT"):
             length = int(self.headers.get("Content-Length", "0"))
             if length > 1024 * 1024:
                 self._write(413, {"error": "request body too large"})
@@ -271,6 +310,9 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self._dispatch("POST")
+
+    def do_PUT(self):
+        self._dispatch("PUT")
 
     def log_message(self, format_string, *args):
         # Keep the MVP quiet in tests and containers.
