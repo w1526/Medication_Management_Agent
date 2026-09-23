@@ -678,18 +678,26 @@ class MedicationService:
                 connection, review_event,
                 "confirmation_review:%s" % assessment_id,
             )
+            review_reason = (
+                "EXCESS_REMOVAL_SUSPECTED"
+                if policy["has_excess_removal"] else "EVIDENCE_CONFLICT"
+            )
             manual_review = self._event(
                 "manual_review.request", "m5_confirmation",
                 elder_id=occurrence["elder_id"], plan_id=occurrence["plan_id"],
                 occurrence_id=occurrence["occurrence_id"], payload=dict(
                     assessment_payload,
-                    review_reason=(
-                        "EXCESS_REMOVAL_SUSPECTED"
-                        if policy["has_excess_removal"] else "EVIDENCE_CONFLICT"
-                    ),
+                    review_reason=review_reason,
                     m6_action="MANUAL_REVIEW",
                 ),
                 occurred_at=assessed_at, trace_id=trace_id,
+            )
+            # Open the M6 task before the M5 event is committed. The bridge
+            # enriches this same event with escalation/step identifiers, so
+            # the complete business state is atomic and no second notification
+            # event is needed.
+            self._open_manual_review_escalation_in_transaction(
+                connection, occurrence, manual_review, assessed_at, review_reason
             )
             self._audit_and_enqueue(
                 connection, manual_review,
@@ -1929,7 +1937,8 @@ class MedicationService:
 
     def get_plan(self, plan_id, version=None):
         row = self.storage.fetchone(
-            "SELECT * FROM medication_plan WHERE plan_id=? AND (? IS NULL OR version=?)",
+            "SELECT * FROM medication_plan WHERE plan_id=? AND (? IS NULL OR version=?) "
+            "ORDER BY version DESC LIMIT 1",
             (plan_id, version, version),
         )
         if row is None:
@@ -2209,15 +2218,15 @@ class MedicationService:
         }
 
     def _create_escalation_step_in_transaction(
-        self, connection, escalation, occurrence, level, clock
+        self, connection, escalation, occurrence, level, clock,
+        notification_event=None,
     ):
-        existing = connection.execute(
-            "SELECT * FROM medication_escalation_step WHERE escalation_id=? AND level=?",
-            (escalation["escalation_id"], level),
-        ).fetchone()
-        if existing is not None:
-            return row_dict(existing)
         event_type = notification_event_type(level)
+        if notification_event is not None:
+            if notification_event.get("event_type") != event_type:
+                raise DomainError(
+                    "notification event does not match escalation level", 500
+                )
         if not event_type:
             raise DomainError("unsupported escalation notification level", 500)
         trace_id = "escalation:%s" % escalation["escalation_id"]
@@ -2228,21 +2237,46 @@ class MedicationService:
             "priority": "high" if level == LEVEL_MANUAL_REVIEW else "normal",
             "trace_id": trace_id,
         })
-        event = self._event(
-            event_type,
-            "m6_escalation",
-            elder_id=escalation["elder_id"],
-            plan_id=escalation["plan_id"],
-            occurrence_id=escalation["occurrence_id"],
-            payload=payload,
-            occurred_at=clock,
-            trace_id=trace_id,
-        )
-        self._audit_and_enqueue(
-            connection,
-            event,
-            "escalation_notification:%s:%s" % (escalation["escalation_id"], level),
-        )
+        if notification_event is not None:
+            # The M5 manual_review.request is also the durable notification
+            # event for the M6 manual-review step. Enrich it before the
+            # caller writes the event log/outbox so the local publisher can
+            # mark the step as simulated without creating a second request.
+            original_trace_id = (
+                notification_event.get("trace_id")
+                or (notification_event.get("payload") or {}).get("trace_id")
+            )
+            merged_payload = dict(notification_event.get("payload") or {})
+            merged_payload.update(payload)
+            if original_trace_id:
+                merged_payload["trace_id"] = original_trace_id
+                merged_payload["escalation_trace_id"] = trace_id
+            notification_event["payload"] = merged_payload
+            notification_event["trace_id"] = original_trace_id or trace_id
+
+        existing = connection.execute(
+            "SELECT * FROM medication_escalation_step WHERE escalation_id=? AND level=?",
+            (escalation["escalation_id"], level),
+        ).fetchone()
+        if existing is not None:
+            return row_dict(existing)
+        event = notification_event
+        if event is None:
+            event = self._event(
+                event_type,
+                "m6_escalation",
+                elder_id=escalation["elder_id"],
+                plan_id=escalation["plan_id"],
+                occurrence_id=escalation["occurrence_id"],
+                payload=payload,
+                occurred_at=clock,
+                trace_id=trace_id,
+            )
+            self._audit_and_enqueue(
+                connection,
+                event,
+                "escalation_notification:%s:%s" % (escalation["escalation_id"], level),
+            )
         step = {
             "step_id": new_id("escalation_step"),
             "escalation_id": escalation["escalation_id"],
@@ -2269,19 +2303,116 @@ class MedicationService:
         )
         return step
 
-    def _open_escalation_in_transaction(self, connection, occurrence, source_event, clock):
+    def _open_escalation_in_transaction(
+        self, connection, occurrence, source_event, clock,
+        initial_level_override=None, reason=None, needs_manual_review=None,
+        notification_event=None,
+    ):
         if not self.config.get("escalation_enabled", True):
             return None
+        if initial_level_override is not None and initial_level_override not in ALL_LEVELS:
+            raise DomainError("unsupported initial escalation level", 500)
+        manual_review_requested = bool(
+            initial_level_override == LEVEL_MANUAL_REVIEW
+            or needs_manual_review
+        )
         existing = connection.execute(
             "SELECT * FROM medication_escalation WHERE occurrence_id=?",
             (occurrence["occurrence_id"],),
         ).fetchone()
         if existing is not None:
-            return row_dict(existing)
+            if not manual_review_requested:
+                return row_dict(existing)
+            if existing["status"] not in (STATUS_OPEN, STATUS_ACKNOWLEDGED):
+                # The single-occurrence UNIQUE constraint deliberately keeps
+                # terminal escalation history immutable. The M5 review event
+                # remains auditable, but a resolved/cancelled task is not
+                # silently reopened or replaced.
+                if notification_event is not None:
+                    payload = dict(notification_event.get("payload") or {})
+                    payload.update({
+                        "escalation_id": existing["escalation_id"],
+                        "level": existing["current_level"],
+                        "target_role": target_role(existing["current_level"]),
+                        "action": notification_event_type(existing["current_level"]),
+                        "m6_escalation_reused": True,
+                        "m6_escalation_terminal": True,
+                    })
+                    notification_event["payload"] = payload
+                return row_dict(existing)
 
+            timestamp = iso(clock)
+            previous_level = existing["current_level"]
+            previous_reason = existing["reason"]
+            updated_reason = str(reason or "EVIDENCE_CONFLICT")
+            cursor = connection.execute(
+                """UPDATE medication_escalation
+                   SET current_level=?, reason=?, needs_manual_review=1,
+                       next_escalation_at=NULL, resolution_deadline_at=NULL,
+                       updated_at=?
+                   WHERE escalation_id=? AND status IN (?, ?)""",
+                (
+                    LEVEL_MANUAL_REVIEW, updated_reason, timestamp,
+                    existing["escalation_id"], STATUS_OPEN, STATUS_ACKNOWLEDGED,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return row_dict(connection.execute(
+                    "SELECT * FROM medication_escalation WHERE escalation_id=?",
+                    (existing["escalation_id"],),
+                ).fetchone())
+            escalation = dict(existing)
+            escalation.update({
+                "current_level": LEVEL_MANUAL_REVIEW,
+                "reason": updated_reason,
+                "needs_manual_review": 1,
+                "next_escalation_at": None,
+                "resolution_deadline_at": None,
+                "updated_at": timestamp,
+            })
+            occurrence_for_payload = dict(occurrence)
+            if previous_level != LEVEL_MANUAL_REVIEW:
+                transition_payload = self._escalation_payload(
+                    escalation, occurrence_for_payload, LEVEL_MANUAL_REVIEW
+                )
+                transition_payload.update({
+                    "from_level": previous_level,
+                    "to_level": LEVEL_MANUAL_REVIEW,
+                    "previous_reason": previous_reason,
+                    "review_reason": updated_reason,
+                    "trigger_event_id": source_event["event_id"],
+                    "trace_id": "escalation:%s" % escalation["escalation_id"],
+                })
+                transition = self._event(
+                    "medication.escalation.escalated",
+                    "m6_escalation",
+                    elder_id=escalation["elder_id"],
+                    plan_id=escalation["plan_id"],
+                    occurrence_id=escalation["occurrence_id"],
+                    payload=transition_payload,
+                    occurred_at=clock,
+                    trace_id=transition_payload["trace_id"],
+                )
+                self._audit_and_enqueue(
+                    connection,
+                    transition,
+                    "escalation_escalated:%s:%s:%s" % (
+                        escalation["escalation_id"],
+                        LEVEL_MANUAL_REVIEW,
+                        source_event["event_id"],
+                    ),
+                )
+            self._create_escalation_step_in_transaction(
+                connection, escalation, occurrence_for_payload,
+                LEVEL_MANUAL_REVIEW, clock,
+                notification_event=notification_event,
+            )
+            return escalation
+
+        reason = str(reason or "closed_unconfirmed")
         missed_count = self._recent_closed_unconfirmed_count(connection, occurrence, clock)
         repeat_threshold = int(self.config.get("escalation_repeat_missed_count", 2))
-        level = initial_level(missed_count, repeat_threshold)
+        level = initial_level_override or initial_level(missed_count, repeat_threshold)
         timeout_key = {
             LEVEL_CAREGIVER: "escalation_caregiver_timeout_minutes",
             LEVEL_FAMILY: "escalation_family_timeout_minutes",
@@ -2300,11 +2431,14 @@ class MedicationService:
             "interaction_id": interaction["interaction_id"] if interaction else None,
             "plan_id": occurrence["plan_id"],
             "plan_version": occurrence["plan_version"],
-            "reason": "closed_unconfirmed",
+            "reason": reason,
             "source_event_id": source_event["event_id"],
             "current_level": level,
             "status": STATUS_OPEN,
-            "needs_manual_review": 0,
+            "needs_manual_review": int(
+                bool(needs_manual_review) if needs_manual_review is not None
+                else level == LEVEL_MANUAL_REVIEW
+            ),
             "opened_at": iso(clock),
             "next_escalation_at": next_at,
             "resolution_deadline_at": None,
@@ -2365,9 +2499,28 @@ class MedicationService:
             "escalation_opened:%s" % escalation["escalation_id"],
         )
         self._create_escalation_step_in_transaction(
-            connection, escalation, occurrence, level, clock
+            connection, escalation, occurrence, level, clock,
+            notification_event=(
+                notification_event if level == LEVEL_MANUAL_REVIEW else None
+            ),
         )
         return escalation
+
+    def _open_manual_review_escalation_in_transaction(
+        self, connection, occurrence, source_event, clock, reason
+    ):
+        """Bridge an M5 review decision directly into the existing M6 model."""
+
+        return self._open_escalation_in_transaction(
+            connection,
+            occurrence,
+            source_event,
+            clock,
+            initial_level_override=LEVEL_MANUAL_REVIEW,
+            reason=reason,
+            needs_manual_review=True,
+            notification_event=source_event,
+        )
 
     def _close_expired(self, clock):
         closed = []
